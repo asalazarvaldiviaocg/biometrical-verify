@@ -1,0 +1,87 @@
+services:
+  api:
+    build: .
+    image: biometrical-verify:dev
+    env_file: .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      minio:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./app:/srv/app:ro
+      - ./alembic:/srv/alembic:ro
+      - ./models:/srv/models:ro
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  worker:
+    build: .
+    image: biometrical-verify:dev
+    env_file: .env
+    depends_on:
+      - redis
+      - db
+      - minio
+    volumes:
+      - ./app:/srv/app:ro
+      - ./models:/srv/models:ro
+    command: celery -A app.workers.celery_app.celery worker --loglevel=info --concurrency=2
+
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: bio
+      POSTGRES_PASSWORD: bio
+      POSTGRES_DB: bio
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bio -d bio"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  minio:
+    image: minio/minio:latest
+    environment:
+      MINIO_ROOT_USER: biominio
+      MINIO_ROOT_PASSWORD: biominio-secret
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  createbuckets:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 biominio biominio-secret &&
+      mc mb -p local/bio-blobs || true &&
+      mc anonymous set none local/bio-blobs &&
+      exit 0
+      "
+
+volumes:
+  pg-data:
+  minio-data:

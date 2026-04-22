@@ -1,0 +1,91 @@
+* { box-sizing: border-box; }
+html, body, #root { height: 100%; margin: 0; }
+body {
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: #0b0f17;
+  color: #e6edf3;
+}
+
+.shell {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 2rem 1rem;
+}
+
+.card {
+  background: #111826;
+  border: 1px solid #1f2937;
+  border-radius: 12px;
+  padding: 1.5rem;
+  margin-top: 1rem;
+}
+
+h1 { font-size: 1.5rem; margin: 0 0 0.25rem; }
+.subtle { color: #94a3b8; font-size: 0.9rem; }
+
+.dropzone {
+  border: 2px dashed #334155;
+  border-radius: 8px;
+  padding: 1rem;
+  text-align: center;
+  cursor: pointer;
+}
+.dropzone input { display: none; }
+.dropzone:hover { background: #0f172a; }
+
+.preview {
+  width: 100%;
+  max-width: 480px;
+  border-radius: 12px;
+  background: #000;
+  aspect-ratio: 1 / 1;
+  object-fit: cover;
+  display: block;
+  margin: 0.75rem auto;
+}
+
+.challenge {
+  font-size: 1.1rem;
+  font-weight: 600;
+  text-align: center;
+  margin: 0.75rem 0;
+  color: #fbbf24;
+}
+
+button {
+  background: #2563eb;
+  color: white;
+  border: 0;
+  padding: 0.7rem 1.2rem;
+  border-radius: 8px;
+  font-weight: 600;
+  cursor: pointer;
+}
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+button.secondary { background: #334155; }
+
+.status {
+  margin-top: 0.75rem;
+  font-size: 0.95rem;
+  color: #cbd5e1;
+}
+
+.result {
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  background: #020617;
+  border-radius: 8px;
+  padding: 0.75rem;
+  white-space: pre-wrap;
+  font-size: 0.85rem;
+}
+
+.badge {
+  display: inline-block;
+  padding: 0.25rem 0.6rem;
+  border-radius: 999px;
+  font-weight: 700;
+  font-size: 0.85rem;
+}
+.badge.APPROVE { background: #064e3b; color: #6ee7b7; }
+.badge.REVIEW  { background: #78350f; color: #fbbf24; }
+.badge.REJECT  { background: #7f1d1d; color: #fecaca; }

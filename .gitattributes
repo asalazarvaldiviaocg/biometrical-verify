@@ -1,0 +1,13 @@
+# Normalise line endings — LF in repo, native on checkout for shells/scripts
+* text=auto eol=lf
+
+# Binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.pdf binary
+*.onnx binary
+*.tflite binary
+*.zip binary
+*.gz binary

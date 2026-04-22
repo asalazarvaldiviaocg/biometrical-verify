@@ -1,0 +1,8 @@
+-r requirements.txt
+pytest>=8.1
+pytest-asyncio>=0.23
+pytest-cov>=4.1
+ruff>=0.4
+mypy>=1.9
+types-requests
+freezegun>=1.4
