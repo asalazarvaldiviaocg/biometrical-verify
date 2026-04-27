@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from celery import Celery
+from celery.schedules import crontab
 
 from app.core.config import get_settings
 
@@ -26,3 +27,25 @@ celery.conf.update(
     task_time_limit=120,
     task_soft_time_limit=90,
 )
+
+# Periodic background tasks. Run a Celery beat process alongside the worker
+# (`celery -A app.workers.celery_app.celery beat`) — the docker-compose stack
+# already includes a `beat` service for this.
+celery.conf.beat_schedule = {
+    "requeue-stuck-verifications": {
+        "task":     "verify.requeue_stuck",
+        "schedule": 60.0,            # every 60 s — aligns with the 5-min cutoff
+        "options":  {"queue": "verify"},
+    },
+    "purge-expired-nonces": {
+        "task":     "verify.purge_expired_nonces",
+        "schedule": crontab(minute="*/15"),
+        "options":  {"queue": "verify"},
+    },
+    "purge-revoked-keks": {
+        "task":     "verify.purge_revoked_keks",
+        # Daily 03:17 UTC — middle-of-night, off main traffic window
+        "schedule": crontab(hour=3, minute=17),
+        "options":  {"queue": "verify"},
+    },
+}

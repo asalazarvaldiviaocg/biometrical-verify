@@ -31,11 +31,11 @@ class MatchResult:
     similarity: float
     threshold: float
     model: str
-    embedding_id: bytes
-    embedding_selfie: bytes
+    # Embeddings are kept off the result by default to avoid carrying raw
+    # biometric vectors through logs / receipts. Re-extract on demand if a
+    # caller genuinely needs them (e.g. for an offline audit).
 
     def to_public(self) -> dict:
-        """Strip embeddings for client-facing payloads."""
         return {
             "verified": self.verified,
             "distance": self.distance,
@@ -98,14 +98,24 @@ def compare(id_image_bytes: bytes, selfie_image_bytes: bytes) -> MatchResult:
         similarity=sim,
         threshold=_settings.match_threshold,
         model=_settings.face_model_name,
-        embedding_id=emb_id.tobytes(),
-        embedding_selfie=emb_self.tobytes(),
     )
 
 
 def best_frame_from_video(video_path: str, max_frames: int = 60) -> bytes:
     """Sample up to `max_frames`, return JPEG bytes of the sharpest one."""
     cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        cap.release()
+        raise RuntimeError(f"Could not open video at {video_path}")
+    # Hard cap on declared frame count to guard against pathological files
+    # that report millions of frames and would tie up the worker walking
+    # them. Anything beyond ~10× the sample size is suspicious.
+    declared = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    if declared > max_frames * 100:
+        cap.release()
+        raise RuntimeError(
+            f"Video declares {declared} frames; refusing to process (cap={max_frames * 100})"
+        )
     best_score = -1.0
     best_jpeg: bytes | None = None
     seen = 0

@@ -27,6 +27,8 @@ def create_access_token(subject: str, claims: dict[str, Any] | None = None) -> s
     now = datetime.now(UTC)
     payload = {
         "sub": subject,
+        "iss": s.jwt_issuer,
+        "aud": s.jwt_audience,
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(minutes=s.jwt_expire_minutes)).timestamp()),
         **(claims or {}),
@@ -36,7 +38,14 @@ def create_access_token(subject: str, claims: dict[str, Any] | None = None) -> s
 
 def decode_token(token: str) -> dict[str, Any]:
     s = get_settings()
-    return jwt.decode(token, s.jwt_secret, algorithms=[s.jwt_alg])
+    return jwt.decode(
+        token,
+        s.jwt_secret,
+        algorithms=[s.jwt_alg],
+        audience=s.jwt_audience,
+        issuer=s.jwt_issuer,
+        options={"require": ["sub", "exp", "iat", "iss", "aud"]},
+    )
 
 
 # ---------- Receipt signing (Ed25519) ----------
@@ -55,6 +64,13 @@ def _load_or_create_signing_key() -> Ed25519PrivateKey:
             raise ValueError("RECEIPT_SIGNING_KEY must decode to 32 bytes")
         _signing_key = Ed25519PrivateKey.from_private_bytes(raw)
     else:
+        # Production validation in Settings.model_validator already refuses to
+        # boot without a fixed key. This branch only runs in dev/test.
+        if s.is_prod:
+            raise RuntimeError(
+                "RECEIPT_SIGNING_KEY is required in production "
+                "(autogenerating on each restart would invalidate every prior receipt)"
+            )
         _signing_key = Ed25519PrivateKey.generate()
     return _signing_key
 
@@ -62,6 +78,16 @@ def _load_or_create_signing_key() -> Ed25519PrivateKey:
 def public_key_b64() -> str:
     pub: Ed25519PublicKey = _load_or_create_signing_key().public_key()
     return base64.b64encode(pub.public_bytes(Encoding.Raw, PublicFormat.Raw)).decode()
+
+
+def public_key_id() -> str:
+    """Stable short identifier for the active receipt-signing pubkey.
+    Verifiers pin this against the value served by /api/v1/keys.
+    """
+    raw = _load_or_create_signing_key().public_key().public_bytes(
+        Encoding.Raw, PublicFormat.Raw
+    )
+    return hashlib.sha256(raw).hexdigest()[:16]
 
 
 def private_key_b64() -> str:
@@ -76,7 +102,16 @@ def canonical_json(obj: Any) -> bytes:
 
 
 def sign_receipt(payload: dict[str, Any]) -> dict[str, Any]:
-    body = {**payload, "signed_at": datetime.now(UTC).isoformat()}
+    body = {
+        **payload,
+        "signed_at": datetime.now(UTC).isoformat(),
+        # Embed a stable key identifier instead of the public key bytes. A
+        # receipt that carries its own pubkey "verifies against itself" — a
+        # forger swaps the pubkey for their own and the math passes. Verifiers
+        # must look the pubkey up by key_id at /api/v1/keys against a pinned
+        # root of trust.
+        "key_id": public_key_id(),
+    }
     msg = canonical_json(body)
     sig = _load_or_create_signing_key().sign(msg)
     return {
@@ -84,15 +119,21 @@ def sign_receipt(payload: dict[str, Any]) -> dict[str, Any]:
         "signature": base64.b64encode(sig).decode(),
         "alg": "Ed25519",
         "msg_sha256": hashlib.sha256(msg).hexdigest(),
-        "public_key": public_key_b64(),
+        "key_id": body["key_id"],
     }
 
 
-def verify_receipt(receipt: dict[str, Any]) -> bool:
+def verify_receipt(receipt: dict[str, Any], *, trusted_pubkey_b64: str) -> bool:
+    """Verify a receipt against an EXTERNALLY supplied trusted public key.
+
+    Callers must obtain the trusted key out-of-band (e.g. /api/v1/keys
+    pinned at deploy time, or shipped with the verifier). NEVER trust a
+    pubkey embedded in the receipt itself.
+    """
     try:
         body = receipt["payload"]
         sig = base64.b64decode(receipt["signature"])
-        pub_raw = base64.b64decode(receipt["public_key"])
+        pub_raw = base64.b64decode(trusted_pubkey_b64)
         pub = Ed25519PublicKey.from_public_bytes(pub_raw)
         pub.verify(sig, canonical_json(body))
         return True

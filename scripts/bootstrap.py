@@ -8,6 +8,7 @@ Idempotent — safe to re-run.
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import secrets
 import sys
@@ -19,13 +20,17 @@ MODELS_DIR = ROOT / "models"
 ENV_FILE = ROOT / ".env"
 ENV_EXAMPLE = ROOT / ".env.example"
 
-# Multiple mirrors — first one that responds wins. The system gracefully falls
-# back to a sharpness-based heuristic if no model is present (dev only — replace
-# in production). Drop a model in `models/anti_spoof_mn3.onnx` to enable the CNN.
-ANTI_SPOOF_MIRRORS = [
-    "https://huggingface.co/datasets/biometrical-org/anti-spoof-mn3/resolve/main/anti_spoof_mn3.onnx",
-    "https://github.com/hpc203/face-anti-spoofing-using-onnxruntime/raw/main/4_0_0_80x80_MiniFASNetV1SE.onnx",
-]
+# Pinned mirror + SHA-256. Boot will refuse to use any model whose hash does
+# not match this value. Any new mirror must be vetted and added with its real
+# hash; we never accept whatever a redirect happens to deliver.
+#
+# These values reflect the v1 4_0_0_80x80_MiniFASNetV1SE.onnx artifact. Update
+# both URL and hash when rotating to a new model.
+ANTI_SPOOF_URL = (
+    "https://github.com/hpc203/face-anti-spoofing-using-onnxruntime/raw/main/"
+    "4_0_0_80x80_MiniFASNetV1SE.onnx"
+)
+ANTI_SPOOF_SHA256 = "1bda35b3c7adfdedc01dde064cdc3094e5b1e7c2dd7a2cc6810fa54e7894220a"
 ANTI_SPOOF_DEST = MODELS_DIR / "anti_spoof_mn3.onnx"
 
 
@@ -34,45 +39,76 @@ def ensure_models_dir() -> None:
     (MODELS_DIR / ".gitkeep").touch(exist_ok=True)
 
 
+def _sha256_of(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def download_anti_spoof() -> None:
     if ANTI_SPOOF_DEST.exists() and ANTI_SPOOF_DEST.stat().st_size > 0:
-        print(f"[ok] anti-spoof model already present: {ANTI_SPOOF_DEST}")
+        actual = _sha256_of(ANTI_SPOOF_DEST)
+        if actual == ANTI_SPOOF_SHA256:
+            print(f"[ok] anti-spoof model already present and verified: {ANTI_SPOOF_DEST}")
+            return
+        print(f"[!!] existing model hash mismatch ({actual[:16]}...). Re-downloading.")
+        ANTI_SPOOF_DEST.unlink(missing_ok=True)
+
+    if not ANTI_SPOOF_URL.startswith("https://"):
+        print(f"[!!] refusing to download from non-https URL: {ANTI_SPOOF_URL}")
         return
-    for url in ANTI_SPOOF_MIRRORS:
-        print(f"[..] trying {url}")
-        try:
-            urllib.request.urlretrieve(url, ANTI_SPOOF_DEST)
-            if ANTI_SPOOF_DEST.stat().st_size > 1024:
-                print(f"[ok] saved to {ANTI_SPOOF_DEST}")
-                return
-            ANTI_SPOOF_DEST.unlink(missing_ok=True)
-        except Exception as e:
-            print(f"     skip ({type(e).__name__}: {str(e)[:80]})")
-    print("[!!] no mirror reachable — liveness will use sharpness-heuristic fallback.")
-    print(f"     For production, drop your own anti-spoof ONNX at: {ANTI_SPOOF_DEST}")
-    print("     Recommended: Silent-Face-Anti-Spoofing MiniFASNet exported to ONNX.")
+    print(f"[..] downloading {ANTI_SPOOF_URL}")
+    try:
+        # Pinned https URL only; ANTI_SPOOF_SHA256 hash-checked below.
+        urllib.request.urlretrieve(ANTI_SPOOF_URL, ANTI_SPOOF_DEST)  # noqa: S310
+    except Exception as e:
+        ANTI_SPOOF_DEST.unlink(missing_ok=True)
+        print(f"[!!] download failed: {type(e).__name__}: {e}")
+        print(
+            "     The pipeline will refuse to run without a verified model in production. "
+            "Drop a vetted model at the destination manually if your network blocks the host."
+        )
+        return
+
+    actual = _sha256_of(ANTI_SPOOF_DEST)
+    if actual != ANTI_SPOOF_SHA256:
+        ANTI_SPOOF_DEST.unlink(missing_ok=True)
+        print(
+            f"[!!] downloaded file hash {actual[:16]}... does not match expected "
+            f"{ANTI_SPOOF_SHA256[:16]}... — refusing to install."
+        )
+        return
+
+    print(f"[ok] saved + verified: {ANTI_SPOOF_DEST}")
 
 
 def ensure_env() -> None:
     if ENV_FILE.exists():
-        print(f"[ok] {ENV_FILE.name} already exists")
+        print(f"[ok] {ENV_FILE.name} already exists — leaving as is")
         return
     if not ENV_EXAMPLE.exists():
         print(f"[!!] {ENV_EXAMPLE.name} not found")
         return
     text = ENV_EXAMPLE.read_text()
-    # Inject fresh dev secrets
+    # Inject fresh dev secrets.
     master_key = base64.b64encode(secrets.token_bytes(32)).decode()
     receipt_key = base64.b64encode(secrets.token_bytes(32)).decode()
     jwt_secret = secrets.token_urlsafe(48)
+    text = text.replace("MASTER_KEY=", f"MASTER_KEY={master_key}", 1)
     text = text.replace(
-        "MASTER_KEY=ZGV2LW9ubHktbWFzdGVyLWtleS1jaGFuZ2UtbWUtMzItYnl0ZXM=",
-        f"MASTER_KEY={master_key}",
+        "RECEIPT_SIGNING_KEY=", f"RECEIPT_SIGNING_KEY={receipt_key}", 1
     )
-    text = text.replace("RECEIPT_SIGNING_KEY=", f"RECEIPT_SIGNING_KEY={receipt_key}")
-    text = text.replace("JWT_SECRET=dev-jwt-secret-change-me", f"JWT_SECRET={jwt_secret}")
+    text = text.replace("JWT_SECRET=", f"JWT_SECRET={jwt_secret}", 1)
+    text = text.replace(
+        "ANTI_SPOOF_MODEL_SHA256=",
+        f"ANTI_SPOOF_MODEL_SHA256={ANTI_SPOOF_SHA256}",
+        1,
+    )
     ENV_FILE.write_text(text)
-    print(f"[ok] wrote {ENV_FILE.name} with fresh dev secrets")
+    os.chmod(ENV_FILE, 0o600)
+    print(f"[ok] wrote {ENV_FILE.name} with fresh dev secrets (chmod 600)")
 
 
 def main() -> int:

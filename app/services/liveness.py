@@ -9,6 +9,7 @@ MediaPipe FaceMesh.
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import dataclass
 from typing import Literal
 
@@ -24,6 +25,12 @@ _settings = get_settings()
 # Eye landmarks (MediaPipe FaceMesh, refined)
 LEFT_EYE = [33, 160, 158, 133, 153, 144]
 RIGHT_EYE = [362, 385, 387, 263, 373, 380]
+
+# Cap how many frames we'll iterate during liveness analysis even on a video
+# whose declared length is much larger. The submit endpoint already caps the
+# byte size; this is the second line of defence against a worker DoS via a
+# pathological media file with a corrupt/inflated frame count.
+LIVENESS_MAX_FRAMES = 240
 
 
 Challenge = Literal["blink_twice", "blink_once", "turn_head", "none"]
@@ -51,15 +58,56 @@ class LivenessResult:
 
 _session = None
 _input_name: str | None = None
+_session_lock = threading.Lock()
 
 
 def _get_session():
-    global _session, _input_name
+    global _session
     if _session is not None:
         return _session
+    # Two threads racing into first-call would each load the model into RAM.
+    # Cheap to lock here; the slow path runs at most once per process.
+    with _session_lock:
+        if _session is not None:
+            return _session
+        return _load_session_locked()
+
+
+def _load_session_locked():
+    global _session, _input_name
     if not os.path.exists(_settings.anti_spoof_model_path):
+        # In production we refuse to fall back to the sharpness heuristic
+        # silently — that fallback approves printed photos and would silently
+        # downgrade the entire pipeline if a model download failed.
+        if _settings.is_prod:
+            raise RuntimeError(
+                f"Anti-spoof ONNX model missing at {_settings.anti_spoof_model_path}; "
+                "refusing to fall back to sharpness heuristic in production"
+            )
         log.warning("anti_spoof_model_missing", path=_settings.anti_spoof_model_path)
         return None
+
+    # If a hash is configured, verify the file contents match exactly. This
+    # prevents both bit-rot and a swapped-out model.
+    if _settings.anti_spoof_model_sha256:
+        import hashlib
+
+        sha = hashlib.sha256()
+        with open(_settings.anti_spoof_model_path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                sha.update(chunk)
+        actual = sha.hexdigest()
+        if actual.lower() != _settings.anti_spoof_model_sha256.lower():
+            raise RuntimeError(
+                f"Anti-spoof model hash mismatch: expected "
+                f"{_settings.anti_spoof_model_sha256}, got {actual}"
+            )
+    elif _settings.is_prod:
+        raise RuntimeError(
+            "ANTI_SPOOF_MODEL_SHA256 must be configured in production "
+            "so the loaded model is verifiable"
+        )
+
     import onnxruntime as ort
 
     providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
@@ -100,18 +148,27 @@ def _ear(landmarks, idxs, w: int, h: int) -> float:
     return (a + b) / (2.0 * c + 1e-6)
 
 
-def detect_blinks(video_path: str, ear_thr: float = 0.21) -> int:
+def detect_blinks(
+    video_path: str,
+    ear_thr: float = 0.21,
+    max_frames: int = LIVENESS_MAX_FRAMES,
+) -> int:
     import mediapipe as mp
 
     cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        cap.release()
+        raise RuntimeError(f"Could not open video at {video_path}")
     blinks = 0
     closed = False
+    seen = 0
     with mp.solutions.face_mesh.FaceMesh(refine_landmarks=True, max_num_faces=1) as fm:
         try:
-            while True:
+            while seen < max_frames:
                 ok, frame = cap.read()
                 if not ok:
                     break
+                seen += 1
                 h, w = frame.shape[:2]
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 res = fm.process(rgb)
@@ -129,18 +186,27 @@ def detect_blinks(video_path: str, ear_thr: float = 0.21) -> int:
     return blinks
 
 
-def detect_head_turn(video_path: str, min_yaw_deg: float = 18.0) -> bool:
+def detect_head_turn(
+    video_path: str,
+    min_yaw_deg: float = 18.0,
+    max_frames: int = LIVENESS_MAX_FRAMES,
+) -> bool:
     """Cheap nose-position heuristic: detects sideways head movement."""
     import mediapipe as mp
 
     cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        cap.release()
+        raise RuntimeError(f"Could not open video at {video_path}")
     nose_xs: list[float] = []
+    seen = 0
     with mp.solutions.face_mesh.FaceMesh(refine_landmarks=False, max_num_faces=1) as fm:
         try:
-            while True:
+            while seen < max_frames:
                 ok, frame = cap.read()
                 if not ok:
                     break
+                seen += 1
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 res = fm.process(rgb)
                 if not res.multi_face_landmarks:

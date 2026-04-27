@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import base64
+import re
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Known-bad placeholder values that ship in the example file. Boot must reject
+# these in production rather than silently accept them.
+_BAD_DEFAULTS_JWT = {"", "dev-jwt-secret-change-me", "change-me", "secret"}
+_BAD_DEFAULTS_MASTER_KEY_DECODED = b"dev-only-master-key-change-me-32-bytes"
 
 
 class Settings(BaseSettings):
@@ -39,15 +45,17 @@ class Settings(BaseSettings):
     receipt_signing_key: str = ""
 
     # Auth
-    jwt_secret: str = "dev-jwt-secret-change-me"
+    jwt_secret: str = ""
     jwt_alg: str = "HS256"
     jwt_expire_minutes: int = 60
+    jwt_issuer: str = "biometrical"
+    jwt_audience: str = "biometrical-verify"
 
     # Verification policy
     match_threshold: float = 0.68
     liveness_min_score: float = 0.85
-    approve_similarity_min: float = 0.40
-    review_similarity_min: float = 0.32
+    approve_similarity_min: float = 0.55      # was 0.40 — aligned with ArcFace LFW threshold
+    review_similarity_min: float = 0.40       # was 0.32 — keep a 0.15 review band
     blob_retention_days: int = 30
     rate_limit_per_min: int = 5
     max_id_bytes: int = 8 * 1024 * 1024
@@ -55,8 +63,22 @@ class Settings(BaseSettings):
 
     # Models
     anti_spoof_model_path: str = "models/anti_spoof_mn3.onnx"
+    anti_spoof_model_sha256: str = ""
+
     face_model_name: str = "ArcFace"
     face_detector: str = "retinaface"
+
+    @field_validator("jwt_alg")
+    @classmethod
+    def _reject_none_alg(cls, v: str) -> str:
+        # PyJWT 2.x already refuses unsigned tokens by default, but if a
+        # caller passes algorithms=[s.jwt_alg] with jwt_alg="none" the check
+        # is bypassed. Block the misconfiguration at the source.
+        if v.strip().lower() in {"none", ""}:
+            raise ValueError(
+                "JWT_ALG must be a real signature algorithm (HS256/RS256/...), not 'none' or empty"
+            )
+        return v
 
     @field_validator("master_key")
     @classmethod
@@ -69,7 +91,54 @@ class Settings(BaseSettings):
             raise ValueError("MASTER_KEY must be base64") from e
         if len(raw) != 32:
             raise ValueError("MASTER_KEY must decode to 32 bytes (AES-256)")
+        if raw == _BAD_DEFAULTS_MASTER_KEY_DECODED:
+            raise ValueError(
+                "MASTER_KEY is the documented placeholder — generate a fresh one with `make seed`"
+            )
         return v
+
+    @field_validator("anti_spoof_model_sha256")
+    @classmethod
+    def _validate_model_hash(cls, v: str) -> str:
+        if not v:
+            return v
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", v):
+            raise ValueError("ANTI_SPOOF_MODEL_SHA256 must be a 64-char hex string")
+        return v.lower()
+
+    @model_validator(mode="after")
+    def _enforce_prod_invariants(self) -> Settings:
+        if self.app_env != "production":
+            return self
+        problems: list[str] = []
+        if self.jwt_secret in _BAD_DEFAULTS_JWT or len(self.jwt_secret) < 32:
+            problems.append("JWT_SECRET must be set to ≥32 chars of entropy in production")
+        if not self.master_key and self.kms_backend == "local":
+            problems.append("MASTER_KEY must be set when KMS_BACKEND=local")
+        if self.kms_backend == "local":
+            problems.append(
+                "KMS_BACKEND=local is dev-only; switch to KMS_BACKEND=aws + AWS_KMS_KEY_ID for prod"
+            )
+        if self.kms_backend == "aws" and not self.aws_kms_key_id:
+            problems.append("AWS_KMS_KEY_ID must be set when KMS_BACKEND=aws")
+        if not self.receipt_signing_key:
+            problems.append(
+                "RECEIPT_SIGNING_KEY must be set in production — autogeneration would invalidate "
+                "every previously-issued receipt across restarts"
+            )
+        if not self.anti_spoof_model_sha256:
+            problems.append(
+                "ANTI_SPOOF_MODEL_SHA256 must be set in production "
+                "so the loaded model is verifiable"
+            )
+        if "*" in self.cors_origin_list:
+            problems.append("CORS_ORIGINS=* is incompatible with allow_credentials=True")
+        if problems:
+            joined = "\n  - ".join(problems)
+            raise ValueError(
+                f"Refusing to boot in production with insecure configuration:\n  - {joined}"
+            )
+        return self
 
     @property
     def cors_origin_list(self) -> list[str]:

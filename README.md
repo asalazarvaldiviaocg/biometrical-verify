@@ -163,9 +163,15 @@ cd biometrical-verify && make seed && make up
 GET  /api/v1/verify/challenge       → returns a one-time nonce + instruction
 POST /api/v1/verify/submit          → uploads ID + selfie video, returns job_id
 GET  /api/v1/verify/{job_id}        → polls decision + signed receipt
-GET  /healthz                       → liveness probe
-GET  /readyz                        → readiness probe
+GET  /api/v1/keys                   → active Ed25519 public key for receipt verification
+POST /api/v1/admin/users/{id}/erase → crypto-shred a user (admin role required)
+GET  /healthz                       → liveness probe (process up)
+GET  /readyz                        → readiness probe (DB + Redis + S3 + model)
 ```
+
+**Verifying a receipt** — never trust the public key embedded in the receipt
+itself. Pin the active `key_id` published by `/api/v1/keys` at deploy time
+and verify with the matching `public_key_b64`.
 
 Every successful decision returns:
 

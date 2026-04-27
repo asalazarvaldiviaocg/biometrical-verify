@@ -18,9 +18,14 @@ import pytest
 # ---- env defaults BEFORE app imports ----
 os.environ.setdefault("APP_ENV", "development")
 os.environ.setdefault("DATABASE_URL", "sqlite+pysqlite:///:memory:")
-os.environ.setdefault("REDIS_URL", "memory://")
+# Redis URL must parse but does not need to be reachable — the rate-limit
+# code falls back to per-process counters when Redis is unavailable.
+os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
 os.environ.setdefault("KMS_BACKEND", "local")
 os.environ.setdefault("MASTER_KEY", base64.b64encode(b"\x11" * 32).decode())
+os.environ.setdefault(
+    "RECEIPT_SIGNING_KEY", base64.b64encode(b"\x22" * 32).decode()
+)
 os.environ.setdefault("JWT_SECRET", "test-secret-" + "x" * 48)
 os.environ.setdefault("CORS_ORIGINS", "http://localhost")
 os.environ.setdefault("S3_ENDPOINT", "http://localhost:9000")
@@ -48,6 +53,39 @@ sys.modules.setdefault("onnxruntime", MagicMock())
 def settings():
     from app.core.config import get_settings
     return get_settings()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _create_schema(settings):
+    """Create the full schema on the in-memory SQLite engine.
+
+    Verification + AuditEvent + AdminAuditEvent now use a JSON column type
+    that's `JSONB` on Postgres and plain `JSON` on SQLite (see
+    `app.models.verification`), so happy-path /submit tests can write rows
+    without a Postgres container.
+    """
+    from app.db.session import engine
+
+    # Import all models so their tables register with Base.metadata.
+    from app.models import nonce as _nonce  # noqa: F401
+    from app.models import user_kek as _user_kek  # noqa: F401
+    from app.models import verification as _verification  # noqa: F401
+    from app.models.base import Base
+
+    Base.metadata.create_all(engine)
+    yield
+    Base.metadata.drop_all(engine)
+
+
+@pytest.fixture
+def db_session():
+    from app.db.session import SessionLocal
+
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 
 @pytest.fixture

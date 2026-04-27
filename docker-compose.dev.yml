@@ -1,0 +1,20 @@
+# Dev-only overlay. Publishes service ports for local debugging tools.
+# Use:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+#
+# Do NOT apply this overlay in any environment reachable from the internet —
+# it exposes the database, Redis, and MinIO management console on the host.
+
+services:
+  db:
+    ports:
+      - "127.0.0.1:5432:5432"
+
+  redis:
+    ports:
+      - "127.0.0.1:6379:6379"
+
+  minio:
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
