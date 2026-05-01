@@ -75,8 +75,14 @@ image = (
         "onnxruntime>=1.17",
         "opencv-python-headless>=4.9",
         "numpy>=1.26",
+        "scikit-image>=0.22",
         "boto3>=1.34",
     )
+    # Mount the OSS package so Modal functions can import the canonical
+    # signature_engine implementation. Single source of truth for the
+    # comparison algorithm — Modal and the OSS FastAPI app run identical
+    # code instead of two parallel copies that drift over time.
+    .add_local_dir("./app", remote_path="/root/app")
 )
 
 auth_secret = modal.Secret.from_name("biometrical-verify-auth")
@@ -181,6 +187,88 @@ def verify_face(payload: dict, x_verify_auth: str = Header(default="")):
         "threshold": MATCH_THRESHOLD,
         "model": "ArcFace",
     }
+
+
+# ── Signature comparison ────────────────────────────────────────────────────
+# Compares the canvas signature drawn by the signer against the printed
+# signature on the back of their INE/IFE. SHADOW MODE on the contract side —
+# the score is logged but does NOT block signing until calibrated against
+# real-world signatures. Threshold field is informational only.
+SIGNATURE_THRESHOLD = 60
+
+
+@app.function(
+    image=image,
+    secrets=[auth_secret, aws_secret],
+    cpu=2,
+    memory=2048,
+    timeout=60,
+    min_containers=0,
+)
+@modal.fastapi_endpoint(method="POST", docs=True)
+def verify_signature(payload: dict, x_verify_auth: str = Header(default="")):
+    """Compare a canvas signature (base64 PNG) against the signature region
+    of an INE/IFE back-side image stored in S3.
+
+    Body:
+      {
+        "id_back_image_key": "sessions/<id>/id-back-...",
+        "signature_b64": "data:image/png;base64,..."  | "<base64-only>"
+      }
+
+    Response (200):
+      {
+        "similarity": 64,                  # 0–100, higher = more similar
+        "ssim": 0.42,                      # raw SSIM in [-1, 1]
+        "match_pass": true,                # similarity >= threshold
+        "threshold": 60,
+        "id_signature_found": true,        # false if no signature blob detected
+        "model": "ssim+otsu-v1"
+      }
+    """
+    expected = os.environ.get("SHARED_SECRET", "")
+    if not expected or x_verify_auth != expected:
+        raise HTTPException(status_code=401, detail="invalid auth")
+
+    id_back_key = payload.get("id_back_image_key") or ""
+    sig_b64 = payload.get("signature_b64") or ""
+    if not id_back_key or not sig_b64:
+        raise HTTPException(status_code=422, detail="missing id_back_image_key / signature_b64")
+
+    bucket = os.environ.get("BUCKET", "")
+    if not bucket:
+        raise HTTPException(status_code=500, detail="bucket not configured")
+
+    import boto3
+
+    # Single source of truth: the canonical OSS signature engine. Modal and
+    # the standalone FastAPI app at app/main.py both call the same function,
+    # so the comparison algorithm cannot drift between deploy targets.
+    from app.services.signature_engine import compare_signatures_b64
+
+    s3 = boto3.client(
+        "s3",
+        region_name=os.environ.get("AWS_DEFAULT_REGION", "us-west-1"),
+        aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+    )
+
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=id_back_key)
+        id_back_bytes = obj["Body"].read()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"s3_fetch_failed: {exc}") from exc
+
+    try:
+        result = compare_signatures_b64(
+            id_back_bytes, sig_b64, threshold=SIGNATURE_THRESHOLD,
+        )
+    except ValueError as exc:
+        # Engine raises ValueError on decode failures; surface as 422 so the
+        # Node client can map it to a recognisable reason.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return result.to_dict()
 
 
 @app.local_entrypoint()

@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app import __version__
-from app.api import routes_admin, routes_health, routes_keys, routes_verify
+from app.api import routes_admin, routes_health, routes_keys, routes_signature, routes_verify
 from app.core.config import get_settings
 from app.core.logging import configure_logging, get_logger
 
@@ -43,6 +43,7 @@ def create_app() -> FastAPI:
     app.include_router(routes_health.router)
     app.include_router(routes_keys.router)
     app.include_router(routes_verify.router)
+    app.include_router(routes_signature.router)
     app.include_router(routes_admin.router)
     return app
 
