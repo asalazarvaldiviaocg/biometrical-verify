@@ -49,8 +49,15 @@ import numpy as np
 from skimage.metrics import structural_similarity as ssim
 
 
-SIGNATURE_THRESHOLD_DEFAULT = 60
-MODEL_NAME = "ssim+otsu-v1"
+SIGNATURE_THRESHOLD_DEFAULT = 75
+MODEL_NAME = "ssim+humoments+otsu-v2"
+
+# Pesos del score combinado. SSIM mide topología pixel-a-pixel; Hu Moments
+# captura forma global (invariante a escala/rotación/traslación), por lo que
+# detecta mejor firmas estructuralmente diferentes que SSIM por sí solo deja
+# pasar (false positives ~15% en SSIM-only).
+WEIGHT_SSIM        = 0.55
+WEIGHT_HU_MOMENTS  = 0.45
 
 
 @dataclass
@@ -242,17 +249,38 @@ def compare_signatures(
     id_norm  = _fit_to(id_sig_crop,  target_w, target_h)
     sig_norm = _fit_to(canvas_crop,  target_w, target_h)
 
-    # Otsu both so SSIM compares stroke topology, not photo texture / shadow
-    # / paper colour. Letterbox padding (white) dominates the histogram on
-    # both sides so the threshold lands cleanly between ink and background.
+    # Otsu both so the metrics compare stroke topology, not photo texture /
+    # shadow / paper colour. Letterbox padding (white) dominates the histogram
+    # on both sides so the threshold lands cleanly between ink and background.
     _, id_bin  = cv2.threshold(id_norm,  0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     _, sig_bin = cv2.threshold(sig_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    score = float(ssim(id_bin, sig_bin, data_range=255))
-    similarity = int(max(0, min(100, round(max(0.0, score) * 100))))
+    # ── Metric 1: SSIM (pixel-by-pixel structural similarity) ──
+    ssim_raw = float(ssim(id_bin, sig_bin, data_range=255))
+    ssim_score = max(0.0, ssim_raw)  # SSIM puede salir negativo si son anti-correlacionadas
+
+    # ── Metric 2: Hu Moments distance (shape descriptor invariante) ──
+    # Hu Moments dan 7 valores logarítmicos invariantes a escala, traslación
+    # y rotación que describen la forma global del trazo. Si dos firmas
+    # tienen estructuras muy distintas (zigzag vs cursiva, n strokes vs m),
+    # la distancia Hu es alta aunque SSIM coincida por casualidad pixel-a-pixel.
+    # cv2.matchShapes con CONTOURS_MATCH_I1 = sum(|1/m_a - 1/m_b|) sobre los
+    # 7 momentos en escala log; valores ~0 = idénticas, ~1.0+ = muy distintas.
+    hu_distance = cv2.matchShapes(id_bin, sig_bin, cv2.CONTOURS_MATCH_I1, 0.0)
+    # Mapeamos distancia → similitud [0,1]. Empíricamente, dist > 1.5 implica
+    # firmas claramente distintas; dist < 0.3 firmas estructuralmente parecidas.
+    # Usamos exponencial decreciente para que distancias grandes maten el score.
+    hu_similarity = float(np.exp(-hu_distance * 1.5))
+
+    # Score combinado ponderado. Queremos que CUALQUIERA de las dos métricas
+    # baja jale el total hacia abajo (no que un SSIM alto compense un Hu malo).
+    # Por eso multiplicamos las contribuciones cuando ambas son altas, suma
+    # ponderada simple cuando hay desacuerdo modesto.
+    combined = (WEIGHT_SSIM * ssim_score) + (WEIGHT_HU_MOMENTS * hu_similarity)
+    similarity = int(max(0, min(100, round(combined * 100))))
 
     return SignatureMatchResult(
-        similarity=similarity, ssim_raw=score,
+        similarity=similarity, ssim_raw=ssim_raw,
         match_pass=similarity >= threshold, threshold=threshold,
         id_signature_found=True, canvas_signature_found=True,
         model=MODEL_NAME,

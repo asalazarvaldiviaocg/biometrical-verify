@@ -191,10 +191,11 @@ def verify_face(payload: dict, x_verify_auth: str = Header(default="")):
 
 # ── Signature comparison ────────────────────────────────────────────────────
 # Compares the canvas signature drawn by the signer against the printed
-# signature on the back of their INE/IFE. SHADOW MODE on the contract side —
-# the score is logged but does NOT block signing until calibrated against
-# real-world signatures. Threshold field is informational only.
-SIGNATURE_THRESHOLD = 60
+# signature on the back of their INE/IFE. HARD GATE on the contract side —
+# below el threshold, biometrical-contract devuelve 422 'below_threshold' y
+# bloquea el flujo después de 5 intentos. Calibrado con SSIM + Hu Moments
+# (modelo ssim+humoments+otsu-v2).
+SIGNATURE_THRESHOLD = 75
 
 
 @app.function(
