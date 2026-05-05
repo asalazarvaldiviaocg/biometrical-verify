@@ -24,7 +24,6 @@ from app.services.signature_engine import (
     compare_signatures,
 )
 
-
 router = APIRouter(prefix="/api/v1/signature", tags=["signature"])
 log = get_logger(__name__)
 
@@ -91,7 +90,7 @@ async def compare(
         )
     except ValueError as exc:
         # decode failures from the engine surface here
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc))
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
 
     log.info(
         "signature_compare",

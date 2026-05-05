@@ -13,6 +13,7 @@ cryptography>=42.0
 PyJWT>=2.8
 numpy>=1.26
 opencv-python-headless>=4.9
+scikit-image>=0.22  # used by signature_engine.py (SSIM)
 deepface>=0.0.93
 tensorflow-cpu>=2.15,<2.20  # 2.20 hasn't shipped binary wheels for some platforms; cap until ecosystem catches up
 tf-keras                    # required by DeepFace under tensorflow>=2.16, which dropped bundled keras 2.x

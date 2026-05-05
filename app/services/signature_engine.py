@@ -48,16 +48,27 @@ import cv2
 import numpy as np
 from skimage.metrics import structural_similarity as ssim
 
+SIGNATURE_THRESHOLD_DEFAULT = 45
+MODEL_NAME = "ssim+humoments+otsu-v4"
 
-SIGNATURE_THRESHOLD_DEFAULT = 75
-MODEL_NAME = "ssim+humoments+otsu-v2"
-
-# Pesos del score combinado. SSIM mide topología pixel-a-pixel; Hu Moments
-# captura forma global (invariante a escala/rotación/traslación), por lo que
-# detecta mejor firmas estructuralmente diferentes que SSIM por sí solo deja
-# pasar (false positives ~15% en SSIM-only).
-WEIGHT_SSIM        = 0.55
-WEIGHT_HU_MOMENTS  = 0.45
+# Pesos del score combinado SSIM + Hu Moments.
+#
+# History:
+#   v2 (0.55/0.45 additive): producía 70-82 en firmas legítimas Y en
+#     "wrong-but-similar" scribbles. Threshold 75 admitía ambas.
+#   v3 (0.7·min + 0.3·mean): demasiado estricto. Aplastó firmas reales
+#     a 38-41 porque Hu Moments dan distancias altas (similarity 0.3-0.5)
+#     entre firma impresa-en-papel y firma dedo-en-pantalla aunque sean
+#     de la misma persona — las texturas/estilo son fundamentalmente
+#     distintos.
+#   v4 (este): SSIM con peso mayor (0.65) + Hu como check secundario
+#     (0.35). Hu por sí sola no discrimina bien firmas finger-vs-printed,
+#     pero un Hu MUY bajo (forma totalmente distinta) sí debe penalizar.
+#     SSIM lleva el peso porque es la métrica que mejor refleja "se
+#     parecen visualmente" en este pipeline (Otsu binarizado + letterbox
+#     a 384×192).
+WEIGHT_SSIM       = 0.65
+WEIGHT_HU_MOMENTS = 0.35
 
 
 @dataclass
@@ -122,19 +133,12 @@ def _decode_signature_with_alpha(buf: bytes) -> np.ndarray:
 
 # ── Croppers ───────────────────────────────────────────────────────────────
 
-def _crop_signature_region_ine(gray: np.ndarray) -> np.ndarray | None:
-    """INE/IFE back-side has the printed signature in a lower-left band:
-    roughly y in [55%, 92%] of the image height, x in [4%, 62%] of the
-    width. Within that band, find the largest dark connected component
-    and tight-crop to it.
-
-    Returns None if no significant ink blob is found in the band.
+def _crop_signature_in_band(
+    gray: np.ndarray, y0: int, y1: int, x0: int, x1: int,
+) -> np.ndarray | None:
+    """Generic largest-contour cropper inside a normalized band of the image.
+    Used for both INE (lower-left) and passport (lower half) variants.
     """
-    h, w = gray.shape[:2]
-    y0 = int(h * 0.55)
-    y1 = int(h * 0.92)
-    x0 = int(w * 0.04)
-    x1 = int(w * 0.62)
     band = gray[y0:y1, x0:x1]
     if band.size == 0:
         return None
@@ -150,6 +154,9 @@ def _crop_signature_region_ine(gray: np.ndarray) -> np.ndarray | None:
     contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None
+    # Pick the largest contour by bounding-box area, but require a
+    # minimum area to avoid tiny noise/text artifacts being mistaken
+    # for the signature.
     c = max(contours, key=cv2.contourArea)
     x, y, cw, ch = cv2.boundingRect(c)
     if cw * ch < (band.shape[0] * band.shape[1]) * 0.01:
@@ -160,6 +167,46 @@ def _crop_signature_region_ine(gray: np.ndarray) -> np.ndarray | None:
     xb = min(band.shape[1], x + cw + pad)
     yb = min(band.shape[0], y + ch + pad)
     return band[ya:yb, xa:xb]
+
+
+def _crop_signature_region_ine(gray: np.ndarray) -> np.ndarray | None:
+    """INE/IFE back-side: signature lives in the lower-left band, above
+    the MRZ/CIC barcode and to the left of the QR code.
+    Roughly y in [55%, 92%] and x in [4%, 62%].
+    """
+    h, w = gray.shape[:2]
+    return _crop_signature_in_band(
+        gray,
+        y0=int(h * 0.55), y1=int(h * 0.92),
+        x0=int(w * 0.04), x1=int(w * 0.62),
+    )
+
+
+def _crop_signature_region_passport(gray: np.ndarray) -> np.ndarray | None:
+    """Mexican passport bio page: signature appears below the photo /
+    personal info, above the MRZ block at the bottom. Position varies
+    by passport version (book layout, biometric upgrades) so we scan
+    a wider band (lower 60%, full width minus a small left/right margin)
+    and trust the largest-contour heuristic.
+
+    Falls back to the entire lower half if no contour is found in the
+    primary band — handles odd cropping where users photograph just
+    part of the page.
+    """
+    h, w = gray.shape[:2]
+    primary = _crop_signature_in_band(
+        gray,
+        y0=int(h * 0.55), y1=int(h * 0.88),  # exclude MRZ at very bottom
+        x0=int(w * 0.05), x1=int(w * 0.95),
+    )
+    if primary is not None:
+        return primary
+    # Fallback: try the lower half wholesale (handles cropped uploads).
+    return _crop_signature_in_band(
+        gray,
+        y0=int(h * 0.40), y1=int(h * 0.95),
+        x0=0, x1=w,
+    )
 
 
 def _crop_canvas_signature(gray: np.ndarray) -> np.ndarray | None:
@@ -204,21 +251,25 @@ def compare_signatures(
     id_back_bytes: bytes,
     signature_bytes: bytes,
     threshold: int = SIGNATURE_THRESHOLD_DEFAULT,
+    id_type: str = "INE",
 ) -> SignatureMatchResult:
     """Compare a canvas signature against the signature region cropped from
-    the back of an INE/IFE.
+    the user's identification document (INE or Mexican passport).
 
     Args:
-        id_back_bytes: Raw bytes of the INE/IFE back-side image (JPEG/PNG/WebP).
+        id_back_bytes: Raw bytes of the ID image:
+            - INE/IFE: the BACK side (where the printed signature is).
+            - Pasaporte: the bio data page (signature below personal info).
         signature_bytes: Raw bytes of the canvas signature PNG (transparent OK).
         threshold: Pass/fail threshold on the 0–100 similarity score.
+        id_type: "INE" (default) or "PASAPORTE". Selects the region cropper.
 
     Returns:
         SignatureMatchResult — always returns a result, never raises beyond
         decode errors. Use the `reason` field to distinguish:
           - None: comparison ran cleanly.
           - "no_signature_in_id_back": couldn't isolate a signature blob on
-            the INE back. Likely the upload was the front, blurry, or wrong.
+            the ID. Likely the upload was the wrong side, blurry, or wrong.
           - "no_canvas_signature": canvas was empty or noise.
     """
     id_back = _decode_color(id_back_bytes, "id_back")
@@ -227,7 +278,14 @@ def compare_signatures(
     id_gray  = cv2.cvtColor(id_back, cv2.COLOR_BGR2GRAY)
     sig_gray = cv2.cvtColor(sig_img, cv2.COLOR_BGR2GRAY)
 
-    id_sig_crop  = _crop_signature_region_ine(id_gray)
+    # Route to the right region cropper. Passport signature lives in a
+    # different part of the page than INE-back; using the wrong cropper
+    # produces "no_signature_in_id_back" as a false negative.
+    id_type_norm = (id_type or "INE").upper()
+    if id_type_norm == "PASAPORTE":
+        id_sig_crop = _crop_signature_region_passport(id_gray)
+    else:
+        id_sig_crop = _crop_signature_region_ine(id_gray)
     canvas_crop  = _crop_canvas_signature(sig_gray)
 
     if id_sig_crop is None:
@@ -272,10 +330,9 @@ def compare_signatures(
     # Usamos exponencial decreciente para que distancias grandes maten el score.
     hu_similarity = float(np.exp(-hu_distance * 1.5))
 
-    # Score combinado ponderado. Queremos que CUALQUIERA de las dos métricas
-    # baja jale el total hacia abajo (no que un SSIM alto compense un Hu malo).
-    # Por eso multiplicamos las contribuciones cuando ambas son altas, suma
-    # ponderada simple cuando hay desacuerdo modesto.
+    # Score combinado v4 (SSIM-primary additive). Hu solo aporta como
+    # check secundario porque sus distancias son muy altas entre firmas
+    # finger-on-touch y printed-on-paper aunque sean de la misma persona.
     combined = (WEIGHT_SSIM * ssim_score) + (WEIGHT_HU_MOMENTS * hu_similarity)
     similarity = int(max(0, min(100, round(combined * 100))))
 
@@ -291,6 +348,7 @@ def compare_signatures_b64(
     id_back_bytes: bytes,
     signature_b64: str,
     threshold: int = SIGNATURE_THRESHOLD_DEFAULT,
+    id_type: str = "INE",
 ) -> SignatureMatchResult:
     """Convenience wrapper accepting the canvas signature as a base64 string
     (with or without a `data:image/png;base64,` prefix).
@@ -301,4 +359,4 @@ def compare_signatures_b64(
         signature_bytes = base64.b64decode(signature_b64)
     except Exception as exc:
         raise ValueError(f"signature_b64_invalid: {exc}") from exc
-    return compare_signatures(id_back_bytes, signature_bytes, threshold)
+    return compare_signatures(id_back_bytes, signature_bytes, threshold, id_type=id_type)
