@@ -1,15 +1,18 @@
-"""Liveness detection: passive (anti-spoof CNN) + active (challenge response).
+"""Liveness detection: passive (Biometrical Liveness Engine) + active
+(challenge response).
 
-Passive uses a Silent-Face-Anti-Spoofing MiniFASNet ONNX model on a single
-frame. Active verifies that the user performed the requested challenge, e.g.
-blinked at least N times, by tracking eye-aspect-ratio across frames via
-MediaPipe FaceMesh.
+Passive analysis runs the in-house Biometrical Liveness Engine v1 (BLE) — a
+multi-signal ensemble of HSV variance, LBP entropy, FFT spectral ratio,
+YCrCb skin density and Sobel gradient variance. 100% proprietary; no
+external pre-trained model weights. See ``biometrical_liveness_engine.py``
+for the algorithm and weights.
+
+Active verifies the user performed the requested challenge (e.g. blinked
+N times) by tracking eye-aspect-ratio across frames via MediaPipe FaceMesh.
 """
 
 from __future__ import annotations
 
-import os
-import threading
 from dataclasses import dataclass
 from typing import Literal
 
@@ -18,9 +21,12 @@ import numpy as np
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
+from app.services.biometrical_liveness_engine import analyze as ble_analyze
 
 log = get_logger(__name__)
 _settings = get_settings()
+
+
 
 # Eye landmarks (MediaPipe FaceMesh, refined)
 LEFT_EYE = [33, 160, 158, 133, 153, 144]
@@ -54,88 +60,17 @@ class LivenessResult:
         }
 
 
-# ---------- passive (ONNX) ----------
-
-_session = None
-_input_name: str | None = None
-_session_lock = threading.Lock()
-
-
-def _get_session():
-    global _session
-    if _session is not None:
-        return _session
-    # Two threads racing into first-call would each load the model into RAM.
-    # Cheap to lock here; the slow path runs at most once per process.
-    with _session_lock:
-        if _session is not None:
-            return _session
-        return _load_session_locked()
-
-
-def _load_session_locked():
-    global _session, _input_name
-    if not os.path.exists(_settings.anti_spoof_model_path):
-        # In production we refuse to fall back to the sharpness heuristic
-        # silently — that fallback approves printed photos and would silently
-        # downgrade the entire pipeline if a model download failed.
-        if _settings.is_prod:
-            raise RuntimeError(
-                f"Anti-spoof ONNX model missing at {_settings.anti_spoof_model_path}; "
-                "refusing to fall back to sharpness heuristic in production"
-            )
-        log.warning("anti_spoof_model_missing", path=_settings.anti_spoof_model_path)
-        return None
-
-    # If a hash is configured, verify the file contents match exactly. This
-    # prevents both bit-rot and a swapped-out model.
-    if _settings.anti_spoof_model_sha256:
-        import hashlib
-
-        sha = hashlib.sha256()
-        with open(_settings.anti_spoof_model_path, "rb") as fh:
-            for chunk in iter(lambda: fh.read(1 << 20), b""):
-                sha.update(chunk)
-        actual = sha.hexdigest()
-        if actual.lower() != _settings.anti_spoof_model_sha256.lower():
-            raise RuntimeError(
-                f"Anti-spoof model hash mismatch: expected "
-                f"{_settings.anti_spoof_model_sha256}, got {actual}"
-            )
-    elif _settings.is_prod:
-        raise RuntimeError(
-            "ANTI_SPOOF_MODEL_SHA256 must be configured in production "
-            "so the loaded model is verifiable"
-        )
-
-    import onnxruntime as ort
-
-    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-    _session = ort.InferenceSession(_settings.anti_spoof_model_path, providers=providers)
-    _input_name = _session.get_inputs()[0].name
-    return _session
-
-
-def _preprocess(face_bgr: np.ndarray, size: int = 80) -> np.ndarray:
-    img = cv2.resize(face_bgr, (size, size))
-    img = img.astype(np.float32) / 255.0
-    img = np.transpose(img, (2, 0, 1))[None, ...]
-    return img
+# ---------- passive (Biometrical Liveness Engine) ----------
+# The previous implementation depended on a Silent-Face-Anti-Spoofing
+# MiniFASNet ONNX model whose source URL went dead. We replaced it with the
+# in-house BLE — see app/services/biometrical_liveness_engine.py for the
+# algorithm. This wrapper preserves the previous public signature so the
+# orchestrator below didn't need to change.
 
 
 def passive_liveness_score(face_bgr: np.ndarray) -> float:
-    sess = _get_session()
-    if sess is None:
-        # Fallback heuristic: texture sharpness — better than nothing in dev,
-        # NEVER acceptable in prod (the warning above flags it).
-        gray = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2GRAY)
-        sharp = cv2.Laplacian(gray, cv2.CV_64F).var()
-        return float(min(1.0, sharp / 250.0))
-    x = _preprocess(face_bgr)
-    out = sess.run(None, {_input_name: x})[0]
-    e = np.exp(out - out.max())
-    probs = e / e.sum(axis=1, keepdims=True)
-    return float(probs[0, 1])  # class 1 = live
+    """Run BLE on a single face crop and return the fused score in [0, 1]."""
+    return ble_analyze(face_bgr).score
 
 
 # ---------- active (MediaPipe blink count) ----------
