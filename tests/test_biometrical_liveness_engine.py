@@ -26,7 +26,6 @@ import pytest
 
 from app.services import biometrical_liveness_engine as ble
 
-
 # ────────────────────────────────────────────────────────────────────────────
 # Synthetic image factories
 # ────────────────────────────────────────────────────────────────────────────

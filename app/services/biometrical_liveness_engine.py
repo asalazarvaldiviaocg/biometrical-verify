@@ -56,7 +56,6 @@ Performance:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict
 
 import cv2
 import numpy as np
@@ -107,7 +106,7 @@ class SignalScores:
     fft_ratio:         float = 0.0
     skin_density:      float = 0.0
     gradient_variance: float = 0.0
-    notes:             Dict[str, float] = field(default_factory=dict)
+    notes:             dict[str, float] = field(default_factory=dict)
 
 
 @dataclass
