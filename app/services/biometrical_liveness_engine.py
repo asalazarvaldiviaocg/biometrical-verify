@@ -64,7 +64,22 @@ import numpy as np
 # Default threshold above which we treat the score as a passing live face.
 # Tunable via Settings.liveness_min_score; this is the engine's intrinsic
 # default when the caller doesn't override.
-LIVENESS_PASS_THRESHOLD = 0.65
+#
+# v1 permissive default (0.35):
+#   We have not yet calibrated against a labelled production dataset, so
+#   we ship a deliberately PERMISSIVE threshold to minimise false rejects
+#   on real users. Defense-in-depth is preserved by the OTHER active layers
+#   (blink challenge, video-consent with spoken folio, identity continuity
+#   across 4 frames, name match against ID OCR, lip-sync check). BLE here
+#   acts as a TIE-BREAKER, not the only gate.
+#
+# Future tightening:
+#   Once we have ~500 real selfies + 200 presentation attacks labelled,
+#   re-fit the per-signal weights and bump this default to 0.55-0.65.
+#   Use `LIVENESS_STRICT_THRESHOLD` below for that calibrated value so
+#   the upgrade is a one-line constant flip.
+LIVENESS_PASS_THRESHOLD     = 0.35  # v1, ship-now permissive
+LIVENESS_STRICT_THRESHOLD   = 0.65  # post-calibration target
 
 # Signal weights — must sum to 1.0 (asserted at import time below).
 WEIGHT_HSV_VARIANCE       = 0.18
