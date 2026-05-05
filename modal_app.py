@@ -195,7 +195,13 @@ def verify_face(payload: dict, x_verify_auth: str = Header(default="")):
 # below el threshold, biometrical-contract devuelve 422 'below_threshold' y
 # bloquea el flujo después de 5 intentos. Calibrado con SSIM + Hu Moments
 # (modelo ssim+humoments+otsu-v2).
-SIGNATURE_THRESHOLD = 75
+#
+# v1 ship-now permissive (37): legitimate signers with poor lighting / fast
+# strokes / passport bio-page glare were getting flagged as no-match. Half
+# of the previous 75 threshold reduces false-rejects while the other layers
+# (face match, video consent, identity continuity, name OCR) absorb the
+# residual fraud risk. Re-tune up once we have a labelled production corpus.
+SIGNATURE_THRESHOLD = 37
 
 
 @app.function(
