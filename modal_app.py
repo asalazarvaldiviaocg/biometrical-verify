@@ -239,6 +239,11 @@ def verify_signature(payload: dict, x_verify_auth: str = Header(default="")):
 
     id_back_key = payload.get("id_back_image_key") or ""
     sig_b64 = payload.get("signature_b64") or ""
+    # `id_type` selects the signature-region cropper. Defaults to INE so
+    # legacy callers that only ever sent INE keep working without changes.
+    id_type = (payload.get("id_type") or "INE").upper()
+    if id_type not in ("INE", "PASAPORTE"):
+        raise HTTPException(status_code=422, detail="invalid id_type (must be INE or PASAPORTE)")
     if not id_back_key or not sig_b64:
         raise HTTPException(status_code=422, detail="missing id_back_image_key / signature_b64")
 
@@ -268,7 +273,9 @@ def verify_signature(payload: dict, x_verify_auth: str = Header(default="")):
 
     try:
         result = compare_signatures_b64(
-            id_back_bytes, sig_b64, threshold=SIGNATURE_THRESHOLD,
+            id_back_bytes, sig_b64,
+            threshold=SIGNATURE_THRESHOLD,
+            id_type=id_type,
         )
     except ValueError as exc:
         # Engine raises ValueError on decode failures; surface as 422 so the

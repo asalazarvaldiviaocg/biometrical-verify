@@ -24,11 +24,62 @@ log = get_logger(__name__)
 _settings = get_settings()
 
 
+CALIBRATION_VERSION = "piecewise-v1-aggressive"
+
+
+def calibrate_similarity(raw: float) -> float:
+    """Map raw cosine similarity (0..1) to a calibrated similarity (0..1).
+
+    Raw cosine similarity from ArcFace + retinaface naturally falls in the
+    0.30-0.65 range for genuine same-identity ID-vs-selfie pairs because of
+    factors unrelated to identity discrimination (print degradation of the
+    laminated ID, age difference between the ID photo and the live selfie,
+    indoor vs outdoor lighting, low-resolution scanner output). Below 0.55
+    the raw cosine reads as "low" to non-technical operators even though
+    the LFW threshold for ArcFace is 0.32.
+
+    This monotonic piecewise curve maps the model's actual discrimination
+    zone to a more interpretable display range. The curve is monotonic
+    (no inversions) so ranking is preserved, and the impostor zone (raw <
+    0.30) is left untouched so the calibrator cannot "rescue" actual
+    non-matches. The verified flag stays based on raw distance.
+
+    Output is in the same 0..1 scale as the input to keep the contract
+    stable. Multiply by 100 only at display time.
+
+        raw 0.30  → 0.30
+        raw 0.40  → 0.65   (lift hard for low-genuine)
+        raw 0.47  → ~0.75
+        raw 0.50  → 0.78
+        raw 0.55  → 0.85
+        raw 0.60  → 0.88
+        raw 0.70  → 0.93
+        raw 0.80  → 0.95
+        raw 1.00  → 1.00
+
+    The raw similarity is still recorded on MatchResult.similarity and is
+    what gets signed into the evidence bundle HMAC. Calibrated value is
+    purely for human consumption (dashboard rings, PDF "score" line).
+    """
+    s = max(0.0, min(1.0, raw))
+    if s < 0.30:
+        return s
+    if s < 0.40:
+        return 0.30 + (s - 0.30) * (0.65 - 0.30) / (0.40 - 0.30)
+    if s < 0.55:
+        return 0.65 + (s - 0.40) * (0.85 - 0.65) / (0.55 - 0.40)
+    if s < 0.70:
+        return 0.85 + (s - 0.55) * (0.93 - 0.85) / (0.70 - 0.55)
+    return min(1.0, 0.93 + (s - 0.70) * (1.00 - 0.93) / (1.00 - 0.70))
+
+
 @dataclass
 class MatchResult:
     verified: bool
     distance: float
     similarity: float
+    similarity_calibrated: float
+    calibration_version: str
     threshold: float
     model: str
     # Embeddings are kept off the result by default to avoid carrying raw
@@ -40,6 +91,8 @@ class MatchResult:
             "verified": self.verified,
             "distance": self.distance,
             "similarity": self.similarity,
+            "similarity_calibrated": self.similarity_calibrated,
+            "calibration_version": self.calibration_version,
             "threshold": self.threshold,
             "model": self.model,
         }
@@ -92,10 +145,13 @@ def compare(id_image_bytes: bytes, selfie_image_bytes: bytes) -> MatchResult:
 
     dist = cosine_distance(emb_id, emb_self)
     sim = 1.0 - dist
+    sim_cal = calibrate_similarity(sim)
     return MatchResult(
         verified=dist <= _settings.match_threshold,
         distance=dist,
         similarity=sim,
+        similarity_calibrated=sim_cal,
+        calibration_version=CALIBRATION_VERSION,
         threshold=_settings.match_threshold,
         model=_settings.face_model_name,
     )

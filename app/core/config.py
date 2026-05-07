@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     match_threshold: float = 0.68
     liveness_min_score: float = 0.85
     approve_similarity_min: float = 0.55      # was 0.40 — aligned with ArcFace LFW threshold
-    review_similarity_min: float = 0.40       # was 0.32 — keep a 0.15 review band
+    review_similarity_min: float = 0.45       # was 0.40 — narrows the gray zone (0.45-0.55 → REVIEW; <0.45 → REJECT)
     blob_retention_days: int = 30
     rate_limit_per_min: int = 5
     max_id_bytes: int = 8 * 1024 * 1024
