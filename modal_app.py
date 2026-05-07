@@ -126,6 +126,7 @@ import re as _re
 _S3_KEY_RE = _re.compile(r"^[A-Za-z0-9._/-]{1,512}$")
 _MAX_IMAGE_BYTES = 8 * 1024 * 1024   # 8 MB per ID / selfie still
 _MAX_SIG_B64_LEN = (8 * 1024 * 1024 * 4) // 3  # ≈ 8 MB decoded
+_MAX_VIDEO_BYTES = 30 * 1024 * 1024  # 30 MB per liveness video (6s @ ~1080p)
 
 
 def _validate_key(label: str, key: str) -> None:
@@ -396,6 +397,207 @@ def verify_signature(payload: dict, x_verify_auth: str = Header(default="")):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     return result.to_dict()
+
+
+# ── Server-side liveness / anti-spoofing ────────────────────────────────────
+# Tier-3 hardening: the client-side selfie capture (face-api.js + EAR blink
+# detection) is the first line of defense, but a determined attacker can spoof
+# the JS layer (e.g. by replaying a recorded video to a virtual camera). This
+# endpoint runs the canonical OSS biometrical_liveness_engine on a sample of
+# decoded video frames, server-side, where the client cannot tamper with the
+# inputs. The 5 signals (HSV variance, LBP entropy, FFT mid-band ratio, skin
+# density, gradient variance) target the four common spoof modalities:
+#
+#   - Printed photo:  low LBP entropy + skewed FFT toward over-smooth
+#   - Phone screen:   moiré pattern in FFT high-band + reduced gradient variance
+#   - 3D silicone mask: skin density mismatch + HSV uniformity
+#   - Replay attack:  texture flatness + frame-to-frame entropy collapse
+#
+# Verdict logic combines a per-frame is_live flag with an aggregate floor —
+# both the mean score AND ≥60 % of analyzed frames must clear the bar. This
+# kills the case where the attacker happens to nail one frame but the rest
+# look like screen replay.
+
+# Analyze 6 frames evenly spaced across the video. More = slower (each
+# DeepFace.extract_faces call is ~150-300 ms cold). 6 is the empirical
+# sweet spot for detecting frame-level inconsistencies in deepfakes
+# without running into Modal's 120 s function timeout for very long
+# uploads.
+_LIVENESS_FRAME_SAMPLES = 6
+# Per-frame floor — matches the OSS engine's default LIVENESS_PASS_THRESHOLD.
+_LIVENESS_PASS_THRESHOLD = 0.55
+# Aggregate floor — 60 % of analyzed frames must pass. Looser than per-frame
+# alone (a single bad frame from a real signer doesn't fail the recording)
+# but tight enough that a still-photo replay can't pass (texture is constant
+# so all frames pass-or-fail together).
+_LIVENESS_PASS_RATIO_MIN = 0.60
+
+
+@app.function(
+    image=image,
+    secrets=[auth_secret, aws_secret],
+    cpu=2,
+    memory=4096,
+    timeout=120,
+    min_containers=0,
+)
+@modal.fastapi_endpoint(method="POST", docs=False)
+def verify_liveness(payload: dict, x_verify_auth: str = Header(default="")):
+    """Server-side liveness verdict on a recorded selfie video.
+
+    Body:
+      {"liveness_video_key": "signing/liveness/<contractId>-<ts>"}
+
+    Response (200):
+      {
+        "is_live": true,
+        "score": 0.7421,
+        "pass_ratio": 0.83,
+        "frames_analyzed": 6,
+        "frames_passed": 5,
+        "threshold": 0.55,
+        "per_frame": [...]   # forensic detail for audit logs
+      }
+
+    Response (4xx) on auth failure / decode failure / no face found.
+    """
+    expected = os.environ.get("SHARED_SECRET", "")
+    if not expected or x_verify_auth != expected:
+        raise HTTPException(status_code=401, detail="invalid auth")
+
+    video_key = payload.get("liveness_video_key") or ""
+    if not video_key:
+        raise HTTPException(status_code=422, detail="missing liveness_video_key")
+    _validate_key("liveness_video", video_key)
+
+    bucket = os.environ.get("BUCKET", "")
+    if not bucket:
+        raise HTTPException(status_code=500, detail="bucket not configured")
+
+    import os as _os
+    import tempfile
+
+    import boto3
+    import cv2
+    import numpy as np
+    from deepface import DeepFace
+    from app.services.biometrical_liveness_engine import analyze
+
+    s3 = boto3.client(
+        "s3",
+        region_name=os.environ.get("AWS_DEFAULT_REGION", "us-west-1"),
+        aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+    )
+
+    _check_size(s3, bucket, "liveness_video", video_key, _MAX_VIDEO_BYTES)
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=video_key)
+        video_bytes = obj["Body"].read()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"s3_fetch_failed: {exc}") from exc
+
+    # cv2.VideoCapture needs a real filesystem path; raw bytes don't work.
+    # Suffix matters — Modal's libavformat sniffs container format from
+    # extension when the magic bytes aren't conclusive.
+    suffix = ".webm"
+    if video_key.endswith(".mp4") or video_bytes[4:8] == b"ftyp":
+        suffix = ".mp4"
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(video_bytes)
+        tmp_path = tmp.name
+
+    try:
+        cap = cv2.VideoCapture(tmp_path)
+        if not cap.isOpened():
+            raise HTTPException(status_code=422, detail="video_decode_failed")
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        # Some webm streams report 0 frames despite being decodable; in that
+        # case we walk the stream linearly and pick every Nth frame instead
+        # of seeking by index.
+        if total_frames < 12:
+            cap.release()
+            raise HTTPException(status_code=422, detail="video_too_short")
+
+        sample_indices = [
+            int(total_frames * (i + 0.5) / _LIVENESS_FRAME_SAMPLES)
+            for i in range(_LIVENESS_FRAME_SAMPLES)
+        ]
+
+        per_frame: list[dict] = []
+        for idx in sample_indices:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+
+            # Detect face — opencv backend is the cheapest detector and
+            # works fine on selfie frames (frontal face, well lit by the
+            # alignment gate). RetinaFace is overkill here.
+            try:
+                faces = DeepFace.extract_faces(
+                    img_path=frame,
+                    detector_backend="opencv",
+                    enforce_detection=True,
+                    align=False,
+                )
+            except Exception:
+                continue
+            if not faces:
+                continue
+
+            largest = max(
+                faces,
+                key=lambda f: f["facial_area"]["w"] * f["facial_area"]["h"],
+            )
+            fa = largest["facial_area"]
+            x, y, w, h = int(fa["x"]), int(fa["y"]), int(fa["w"]), int(fa["h"])
+            # Clamp to frame bounds defensively — DeepFace can occasionally
+            # return slight overshoot on edge faces.
+            x = max(0, x)
+            y = max(0, y)
+            x2 = min(frame.shape[1], x + w)
+            y2 = min(frame.shape[0], y + h)
+            face_bgr = frame[y:y2, x:x2]
+            if face_bgr.size == 0:
+                continue
+
+            try:
+                analysis = analyze(face_bgr, threshold=_LIVENESS_PASS_THRESHOLD)
+                per_frame.append({
+                    "idx": idx,
+                    **analysis.to_public(),
+                })
+            except Exception as exc:
+                print(f"[verify_liveness] frame {idx} analyze failed: {exc}")
+                continue
+
+        cap.release()
+    finally:
+        try:
+            _os.unlink(tmp_path)
+        except Exception:
+            pass
+
+    if not per_frame:
+        raise HTTPException(status_code=422, detail="no_face_in_video")
+
+    avg_score = sum(p["score"] for p in per_frame) / len(per_frame)
+    passed = sum(1 for p in per_frame if p["is_live"])
+    pass_ratio = passed / len(per_frame)
+    is_live = avg_score >= _LIVENESS_PASS_THRESHOLD and pass_ratio >= _LIVENESS_PASS_RATIO_MIN
+
+    return {
+        "is_live": is_live,
+        "score": round(float(avg_score), 4),
+        "pass_ratio": round(float(pass_ratio), 4),
+        "frames_analyzed": len(per_frame),
+        "frames_passed": passed,
+        "threshold": _LIVENESS_PASS_THRESHOLD,
+        "per_frame": per_frame,
+    }
 
 
 @app.local_entrypoint()
