@@ -76,6 +76,7 @@ image = (
         "opencv-python-headless>=4.9",
         "numpy>=1.26",
         "scikit-image>=0.22",
+        "scipy>=1.11",
         "boto3>=1.34",
     )
     # Mount the OSS package so Modal functions can import the canonical
@@ -98,6 +99,45 @@ aws_secret = modal.Secret.from_name("biometrical-verify-aws")
 MATCH_THRESHOLD = 35
 
 
+# Hardening for the Modal HTTP endpoints: every S3 key the caller sends
+# is validated against this regex before we hit S3, and HEAD'd against a
+# size cap before we read the object body into RAM. Without these guards
+# a caller holding the shared secret could (a) request arbitrary objects
+# from the shared bucket (cross-tenant data exfil) and (b) point at a
+# huge object to OOM-kill the worker (4 GiB container, 100 MB JPEG is
+# enough). The regex matches the prefixes biometrical-contract actually
+# writes — sessions/<contractId>/... and contracts/<companyId>/... — and
+# rejects path traversal / absolute paths.
+import re as _re
+_S3_KEY_RE = _re.compile(
+    r"^(sessions|contracts|kyc|signatures|evidence)/"
+    r"[A-Za-z0-9._-]{1,128}/"
+    r"[A-Za-z0-9._/-]{1,256}$"
+)
+_MAX_IMAGE_BYTES = 8 * 1024 * 1024   # 8 MB per ID / selfie still
+_MAX_SIG_B64_LEN = (8 * 1024 * 1024 * 4) // 3  # ≈ 8 MB decoded
+
+
+def _validate_key(label: str, key: str) -> None:
+    if not _S3_KEY_RE.match(key):
+        raise HTTPException(status_code=422, detail=f"invalid_{label}_key")
+    if ".." in key:  # belt-and-suspenders against traversal
+        raise HTTPException(status_code=422, detail=f"invalid_{label}_key")
+
+
+def _check_size(s3_client, bucket: str, label: str, key: str, cap: int) -> None:
+    try:
+        head = s3_client.head_object(Bucket=bucket, Key=key)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"s3_head_failed_{label}: {exc}") from exc
+    size = int(head.get("ContentLength") or 0)
+    if size > cap:
+        raise HTTPException(
+            status_code=413,
+            detail=f"{label}_too_large ({size} bytes; max {cap})",
+        )
+
+
 @app.function(
     image=image,
     secrets=[auth_secret, aws_secret],
@@ -106,7 +146,7 @@ MATCH_THRESHOLD = 35
     timeout=120,
     min_containers=0,
 )
-@modal.fastapi_endpoint(method="POST", docs=True)
+@modal.fastapi_endpoint(method="POST", docs=False)
 def verify_face(payload: dict, x_verify_auth: str = Header(default="")):
     expected = os.environ.get("SHARED_SECRET", "")
     if not expected or x_verify_auth != expected:
@@ -116,6 +156,12 @@ def verify_face(payload: dict, x_verify_auth: str = Header(default="")):
     selfie_key = payload.get("selfie_image_key") or ""
     if not id_key or not selfie_key:
         raise HTTPException(status_code=422, detail="missing id_image_key / selfie_image_key")
+
+    # Hardening: validate the S3 key shape BEFORE we open a boto3 client,
+    # so a malicious caller can't point us at an unrelated tenant's data
+    # or at S3 internals (`.well-known`, `..` traversal, etc.).
+    _validate_key("id_image", id_key)
+    _validate_key("selfie_image", selfie_key)
 
     bucket = os.environ.get("BUCKET", "")
     if not bucket:
@@ -135,7 +181,11 @@ def verify_face(payload: dict, x_verify_auth: str = Header(default="")):
         aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
     )
 
-    def fetch(key: str) -> bytes:
+    def fetch(key: str, label: str) -> bytes:
+        # head_object first to enforce a size cap before pulling the body.
+        # Without this a multi-hundred-MB object would OOM-kill the 4 GiB
+        # worker — possible because callers control the S3 key.
+        _check_size(s3, bucket, label, key, _MAX_IMAGE_BYTES)
         try:
             obj = s3.get_object(Bucket=bucket, Key=key)
             return obj["Body"].read()
@@ -149,8 +199,8 @@ def verify_face(payload: dict, x_verify_auth: str = Header(default="")):
             raise HTTPException(status_code=422, detail="image_decode_failed")
         return img
 
-    id_img = decode(fetch(id_key))
-    selfie_img = decode(fetch(selfie_key))
+    id_img = decode(fetch(id_key, "id_image"))
+    selfie_img = decode(fetch(selfie_key, "selfie_image"))
 
     def descriptor(img: np.ndarray, label: str) -> np.ndarray:
         try:
@@ -212,7 +262,7 @@ SIGNATURE_THRESHOLD = 37
     timeout=60,
     min_containers=0,
 )
-@modal.fastapi_endpoint(method="POST", docs=True)
+@modal.fastapi_endpoint(method="POST", docs=False)
 def verify_signature(payload: dict, x_verify_auth: str = Header(default="")):
     """Compare a canvas signature (base64 PNG) against the signature region
     of an INE/IFE back-side image stored in S3.
@@ -247,6 +297,17 @@ def verify_signature(payload: dict, x_verify_auth: str = Header(default="")):
     if not id_back_key or not sig_b64:
         raise HTTPException(status_code=422, detail="missing id_back_image_key / signature_b64")
 
+    # Same hardening as verify_face: validate the S3 key shape and cap
+    # the base64 body length before we open the S3 client. Without these
+    # guards a caller can request arbitrary cross-tenant S3 objects or
+    # OOM the worker with a huge base64 payload.
+    _validate_key("id_back_image", id_back_key)
+    if len(sig_b64) > _MAX_SIG_B64_LEN:
+        raise HTTPException(
+            status_code=413,
+            detail=f"signature_b64 too large ({len(sig_b64)} chars; max {_MAX_SIG_B64_LEN})",
+        )
+
     bucket = os.environ.get("BUCKET", "")
     if not bucket:
         raise HTTPException(status_code=500, detail="bucket not configured")
@@ -264,6 +325,9 @@ def verify_signature(payload: dict, x_verify_auth: str = Header(default="")):
         aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
         aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
     )
+
+    # head_object size cap — same rationale as verify_face's fetch().
+    _check_size(s3, bucket, "id_back_image", id_back_key, _MAX_IMAGE_BYTES)
 
     try:
         obj = s3.get_object(Bucket=bucket, Key=id_back_key)

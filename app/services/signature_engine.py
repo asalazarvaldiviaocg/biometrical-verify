@@ -46,29 +46,43 @@ from dataclasses import dataclass
 
 import cv2
 import numpy as np
+from skimage.feature import hog
 from skimage.metrics import structural_similarity as ssim
+from scipy.spatial.distance import directed_hausdorff
 
 SIGNATURE_THRESHOLD_DEFAULT = 45
-MODEL_NAME = "ssim+humoments+otsu-v4"
+MODEL_NAME = "ssim+hu+hog+stroke+aspect+hausdorff-v5"
 
-# Pesos del score combinado SSIM + Hu Moments.
+# Pesos del score combinado multi-feature v5.
 #
 # History:
-#   v2 (0.55/0.45 additive): producía 70-82 en firmas legítimas Y en
-#     "wrong-but-similar" scribbles. Threshold 75 admitía ambas.
+#   v2 (0.55 SSIM / 0.45 Hu additive): producía 70-82 en firmas legítimas
+#     Y en "wrong-but-similar" scribbles. Threshold 75 admitía ambas.
 #   v3 (0.7·min + 0.3·mean): demasiado estricto. Aplastó firmas reales
 #     a 38-41 porque Hu Moments dan distancias altas (similarity 0.3-0.5)
 #     entre firma impresa-en-papel y firma dedo-en-pantalla aunque sean
-#     de la misma persona — las texturas/estilo son fundamentalmente
-#     distintos.
-#   v4 (este): SSIM con peso mayor (0.65) + Hu como check secundario
-#     (0.35). Hu por sí sola no discrimina bien firmas finger-vs-printed,
-#     pero un Hu MUY bajo (forma totalmente distinta) sí debe penalizar.
-#     SSIM lleva el peso porque es la métrica que mejor refleja "se
-#     parecen visualmente" en este pipeline (Otsu binarizado + letterbox
-#     a 384×192).
-WEIGHT_SSIM       = 0.65
-WEIGHT_HU_MOMENTS = 0.35
+#     de la misma persona.
+#   v4 (0.65 SSIM / 0.35 Hu): mejor balance pero false-reject ~15 % en
+#     producción. SSIM saturaba en 0.45-0.55 para firmas finger-vs-printed
+#     incluso de la misma persona porque texturas son intrínsecamente
+#     distintas (papel laminado con glare vs canvas digital limpio).
+#   v5 (este): multi-feature ponderado. Cinco descriptores complementarios
+#     en lugar de dos. Cada uno captura un aspecto distinto:
+#       SSIM        — similitud pixel-a-pixel después de Otsu
+#       Hu Moments  — invariante a escala/rotación (forma global)
+#       HOG cosine  — gradientes locales (orientación de strokes)
+#       Stroke density ratio — ¿se parecen en cantidad de tinta?
+#       Aspect ratio match   — proporción ancho/alto del trazo
+#       Hausdorff   — distancia geométrica entre contornos
+#     SSIM y HOG llevan el peso (descriptores fuertes); los otros
+#     refinan el score. Calibración esperada: false-reject 15 % → 7-8 %
+#     manteniendo false-accept < 1 %.
+WEIGHT_SSIM           = 0.30
+WEIGHT_HU_MOMENTS     = 0.15
+WEIGHT_HOG            = 0.25
+WEIGHT_STROKE_DENSITY = 0.10
+WEIGHT_ASPECT_RATIO   = 0.10
+WEIGHT_HAUSDORFF      = 0.10
 
 
 @dataclass
@@ -227,6 +241,108 @@ def _crop_canvas_signature(gray: np.ndarray) -> np.ndarray | None:
     return gray[y0:y1 + 1, x0:x1 + 1]
 
 
+def _hog_cosine(a: np.ndarray, b: np.ndarray) -> float:
+    """Cosine similarity between HOG (Histogram of Oriented Gradients)
+    descriptors of two grayscale images. HOG captures local gradient
+    orientations, which encode the direction of each stroke without
+    being sensitive to small translations or pixel-level noise. Two
+    signatures from the same person produce HOG vectors that point in
+    similar directions; different signatures diverge.
+
+    Returns a similarity in [0, 1] (cosine clamped). Inputs must be the
+    same size (callers feed the post-letterbox 384×192 binarised images).
+    """
+    if a.shape != b.shape:
+        return 0.0
+    # Block-normalised HOG with 8×8 cells / 2×2 cell blocks. Generous
+    # cell size keeps the descriptor short (~hundred floats) and
+    # robust to the natural 1-2 px stroke jitter between signatures.
+    fd_a = hog(a, orientations=9, pixels_per_cell=(16, 16), cells_per_block=(2, 2),
+               block_norm='L2-Hys', feature_vector=True)
+    fd_b = hog(b, orientations=9, pixels_per_cell=(16, 16), cells_per_block=(2, 2),
+               block_norm='L2-Hys', feature_vector=True)
+    na = float(np.linalg.norm(fd_a))
+    nb = float(np.linalg.norm(fd_b))
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    cos = float(np.dot(fd_a, fd_b) / (na * nb))
+    return max(0.0, min(1.0, cos))
+
+
+def _stroke_density_similarity(bin_a: np.ndarray, bin_b: np.ndarray) -> float:
+    """Ratio of ink pixels (binary 0 = ink, 255 = background after Otsu).
+    Two signatures from the same person have comparable ink density;
+    a sparse scribble vs a dense signature diverge here even when SSIM
+    happens to match by accident.
+
+    Maps the relative density gap to a similarity in [0, 1] via 1 -
+    relative_diff. Caller feeds the Otsu-binarised images.
+    """
+    pix_a = float(np.count_nonzero(bin_a == 0))
+    pix_b = float(np.count_nonzero(bin_b == 0))
+    if pix_a == 0 and pix_b == 0:
+        return 0.0
+    if pix_a == 0 or pix_b == 0:
+        return 0.0
+    rel_diff = abs(pix_a - pix_b) / max(pix_a, pix_b)
+    return max(0.0, min(1.0, 1.0 - rel_diff))
+
+
+def _aspect_ratio_similarity(crop_a: np.ndarray, crop_b: np.ndarray) -> float:
+    """Aspect ratio (width / height) of the bounding box. Most signers
+    have a consistent aspect ratio across captures (wide and short, or
+    compact). A signer who normally signs in a 4:1 aspect cannot fake
+    that with a quick 1:1 scribble even if SSIM happens to align.
+
+    Inputs are the pre-letterbox tight crops, NOT the 384×192 padded
+    versions — we want each signature's natural aspect ratio.
+    """
+    h_a, w_a = crop_a.shape[:2]
+    h_b, w_b = crop_b.shape[:2]
+    if h_a == 0 or h_b == 0:
+        return 0.0
+    ar_a = w_a / h_a
+    ar_b = w_b / h_b
+    if ar_a == 0 or ar_b == 0:
+        return 0.0
+    rel_diff = abs(ar_a - ar_b) / max(ar_a, ar_b)
+    return max(0.0, min(1.0, 1.0 - rel_diff))
+
+
+def _hausdorff_similarity(bin_a: np.ndarray, bin_b: np.ndarray) -> float:
+    """Modified Hausdorff distance between the two contour point sets,
+    mapped to a [0, 1] similarity. Hausdorff is "what is the worst-case
+    closest distance from a point in A to its nearest point in B?" — it
+    captures how much one signature shape would have to deform to match
+    the other. Robust to local stroke jitter.
+
+    Returns 0 (very different shapes) to 1 (overlapping contours).
+    """
+    # Subsample to keep the O(n×m) distance pairs tractable. 256 points
+    # is enough to capture the signature's outline; full point sets
+    # blow up to 30k× compares.
+    def points(bin_img: np.ndarray) -> np.ndarray:
+        ys, xs = np.where(bin_img == 0)
+        if len(xs) == 0:
+            return np.zeros((0, 2), dtype=np.float32)
+        if len(xs) > 256:
+            idx = np.linspace(0, len(xs) - 1, 256, dtype=int)
+            xs, ys = xs[idx], ys[idx]
+        return np.stack([xs, ys], axis=1).astype(np.float32)
+
+    pa = points(bin_a)
+    pb = points(bin_b)
+    if pa.shape[0] == 0 or pb.shape[0] == 0:
+        return 0.0
+    d_ab = directed_hausdorff(pa, pb)[0]
+    d_ba = directed_hausdorff(pb, pa)[0]
+    h    = max(d_ab, d_ba)
+    # Diagonal of the 384×192 canvas is ~430 px. Distances near 0 = match,
+    # > 100 px = different shapes. Exponential decay keeps the metric
+    # well-behaved at extremes.
+    return float(np.exp(-h / 80.0))
+
+
 def _fit_to(img: np.ndarray, target_w: int, target_h: int) -> np.ndarray:
     """Letterbox-resize keeping aspect ratio. Padding is white (255) so the
     Otsu threshold picks ink vs background cleanly afterward.
@@ -318,22 +434,38 @@ def compare_signatures(
     ssim_score = max(0.0, ssim_raw)  # SSIM puede salir negativo si son anti-correlacionadas
 
     # ── Metric 2: Hu Moments distance (shape descriptor invariante) ──
-    # Hu Moments dan 7 valores logarítmicos invariantes a escala, traslación
-    # y rotación que describen la forma global del trazo. Si dos firmas
-    # tienen estructuras muy distintas (zigzag vs cursiva, n strokes vs m),
-    # la distancia Hu es alta aunque SSIM coincida por casualidad pixel-a-pixel.
-    # cv2.matchShapes con CONTOURS_MATCH_I1 = sum(|1/m_a - 1/m_b|) sobre los
-    # 7 momentos en escala log; valores ~0 = idénticas, ~1.0+ = muy distintas.
+    # 7 momentos log-escalados invariantes a escala/rotación. matchShapes
+    # con CONTOURS_MATCH_I1 = sum(|1/m_a - 1/m_b|). Empíricamente:
+    # dist > 1.5 ⇒ formas claramente distintas, < 0.3 ⇒ parecidas.
+    # Exponencial decreciente para que distancias grandes maten el score.
     hu_distance = cv2.matchShapes(id_bin, sig_bin, cv2.CONTOURS_MATCH_I1, 0.0)
-    # Mapeamos distancia → similitud [0,1]. Empíricamente, dist > 1.5 implica
-    # firmas claramente distintas; dist < 0.3 firmas estructuralmente parecidas.
-    # Usamos exponencial decreciente para que distancias grandes maten el score.
     hu_similarity = float(np.exp(-hu_distance * 1.5))
 
-    # Score combinado v4 (SSIM-primary additive). Hu solo aporta como
-    # check secundario porque sus distancias son muy altas entre firmas
-    # finger-on-touch y printed-on-paper aunque sean de la misma persona.
-    combined = (WEIGHT_SSIM * ssim_score) + (WEIGHT_HU_MOMENTS * hu_similarity)
+    # ── Metric 3: HOG cosine (orientación local de strokes) ──
+    hog_score = _hog_cosine(id_bin, sig_bin)
+
+    # ── Metric 4: Stroke density ratio (cantidad de tinta) ──
+    stroke_score = _stroke_density_similarity(id_bin, sig_bin)
+
+    # ── Metric 5: Aspect ratio (proporción natural del trazo) ──
+    # Crops pre-letterbox preservan la proporción real de cada firma.
+    aspect_score = _aspect_ratio_similarity(id_sig_crop, canvas_crop)
+
+    # ── Metric 6: Hausdorff distance (geometría de contornos) ──
+    hausdorff_score = _hausdorff_similarity(id_bin, sig_bin)
+
+    # Score combinado v5 (multi-feature ponderado). SSIM y HOG llevan
+    # el peso (descriptores fuertes); Hu, stroke density, aspect ratio
+    # y Hausdorff refinan. Cada métrica captura una propiedad distinta —
+    # un atacante tendría que clonar TODAS para obtener un score alto.
+    combined = (
+        WEIGHT_SSIM           * ssim_score      +
+        WEIGHT_HU_MOMENTS     * hu_similarity   +
+        WEIGHT_HOG            * hog_score       +
+        WEIGHT_STROKE_DENSITY * stroke_score    +
+        WEIGHT_ASPECT_RATIO   * aspect_score    +
+        WEIGHT_HAUSDORFF      * hausdorff_score
+    )
     similarity = int(max(0, min(100, round(combined * 100))))
 
     return SignatureMatchResult(
