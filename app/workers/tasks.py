@@ -71,10 +71,14 @@ def _decide(
     bind=True,
     max_retries=2,
     acks_late=True,
-    # SoftTimeLimitExceeded fires inside the task — gives us a few seconds to
-    # mark the record as errored before celery sends SIGKILL via time_limit.
-    soft_time_limit=20,
-    time_limit=30,
+    # Cold-start budget: DeepFace (~30 s warm-load on first call) plus
+    # MediaPipe FaceMesh (~5-10 s) plus AES-GCM unwrap, PIL decode,
+    # frame-extract, and BLE pipeline. Earlier limit of 30 s timed out
+    # EVERY first request after a quiet container window, kicking the
+    # task into max_retries=2 retry storms. 90 s soft / 120 s hard
+    # tolerates cold-start while still bounding pathological frames.
+    soft_time_limit=90,
+    time_limit=120,
 )
 def verify_identity_task(self, job_id: str) -> dict:
     db = SessionLocal()
