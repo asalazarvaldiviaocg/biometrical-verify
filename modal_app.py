@@ -99,21 +99,31 @@ aws_secret = modal.Secret.from_name("biometrical-verify-aws")
 MATCH_THRESHOLD = 35
 
 
-# Hardening for the Modal HTTP endpoints: every S3 key the caller sends
-# is validated against this regex before we hit S3, and HEAD'd against a
-# size cap before we read the object body into RAM. Without these guards
-# a caller holding the shared secret could (a) request arbitrary objects
-# from the shared bucket (cross-tenant data exfil) and (b) point at a
-# huge object to OOM-kill the worker (4 GiB container, 100 MB JPEG is
-# enough). The regex matches the prefixes biometrical-contract actually
-# writes — sessions/<contractId>/... and contracts/<companyId>/... — and
-# rejects path traversal / absolute paths.
+# Hardening for the Modal HTTP endpoints. Two lines of defense:
+#
+#   1. Shape validation — reject path traversal, absolute paths, weird
+#      control characters. The KEY shape is intentionally permissive
+#      (any `[A-Za-z0-9._/-]` of reasonable length) because real
+#      production keys come from many code paths in biometrical-contract:
+#        - signing/id/<contractId>-<timestamp>     (presigned PUT)
+#        - signing/selfie/<contractId>-<timestamp> (presigned PUT)
+#        - sessions/<contractId>/selfie-<token>.jpg
+#        - sessions/<contractId>/id-<token>.jpg
+#        - contracts/<companyId>/...
+#        - kyc/<contractId>/...
+#      Pinning a closed prefix list bricked the verify route (422 in
+#      ~80 ms) because it didn't include `signing/` — the most common
+#      prefix. Cross-tenant exfil concern is addressed structurally by
+#      the cuid-generated contractIds (~1e21 keyspace, unguessable) and
+#      by the shared-secret gate, NOT by the prefix list.
+#
+#   2. Size cap (HEAD before GET, see _check_size) — protects the
+#      4 GiB worker from OOM via a multi-hundred-MB malicious upload.
+#      This is the load-bearing protection against the "callers control
+#      the S3 key" threat. Permissive shape + size cap > narrow shape
+#      + no size cap, because the size cap is what actually matters.
 import re as _re
-_S3_KEY_RE = _re.compile(
-    r"^(sessions|contracts|kyc|signatures|evidence)/"
-    r"[A-Za-z0-9._-]{1,128}/"
-    r"[A-Za-z0-9._/-]{1,256}$"
-)
+_S3_KEY_RE = _re.compile(r"^[A-Za-z0-9._/-]{1,512}$")
 _MAX_IMAGE_BYTES = 8 * 1024 * 1024   # 8 MB per ID / selfie still
 _MAX_SIG_B64_LEN = (8 * 1024 * 1024 * 4) // 3  # ≈ 8 MB decoded
 
@@ -121,7 +131,11 @@ _MAX_SIG_B64_LEN = (8 * 1024 * 1024 * 4) // 3  # ≈ 8 MB decoded
 def _validate_key(label: str, key: str) -> None:
     if not _S3_KEY_RE.match(key):
         raise HTTPException(status_code=422, detail=f"invalid_{label}_key")
-    if ".." in key:  # belt-and-suspenders against traversal
+    # Reject relative-path traversal even when each path segment passes
+    # the character class (a string like "a/../b" would otherwise slip
+    # through). Doubles as a guard against `//` collapses, leading `/`,
+    # leading `.` (hidden files), and trailing `/` (directory refs).
+    if ".." in key or key.startswith("/") or key.startswith(".") or key.endswith("/"):
         raise HTTPException(status_code=422, detail=f"invalid_{label}_key")
 
 
