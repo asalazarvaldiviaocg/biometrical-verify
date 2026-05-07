@@ -46,9 +46,9 @@ from dataclasses import dataclass
 
 import cv2
 import numpy as np
+from scipy.spatial.distance import directed_hausdorff
 from skimage.feature import hog
 from skimage.metrics import structural_similarity as ssim
-from scipy.spatial.distance import directed_hausdorff
 
 SIGNATURE_THRESHOLD_DEFAULT = 45
 MODEL_NAME = "ssim+hu+hog+stroke+aspect+hausdorff-v5"
