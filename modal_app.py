@@ -203,26 +203,49 @@ def verify_face(payload: dict, x_verify_auth: str = Header(default="")):
     selfie_img = decode(fetch(selfie_key, "selfie_image"))
 
     def descriptor(img: np.ndarray, label: str) -> np.ndarray:
-        try:
-            reps = DeepFace.represent(
-                img_path=img,
-                model_name="ArcFace",
-                detector_backend="retinaface",
-                enforce_detection=True,
-                align=True,
-                normalization="ArcFace",
-            )
-        except Exception:
-            raise HTTPException(status_code=422, detail=f"no_face_{label}")
-        if not reps:
-            raise HTTPException(status_code=422, detail=f"no_face_{label}")
-        # Pick the largest face detected (handles multi-face frames safely).
-        rep = max(reps, key=lambda r: r["facial_area"]["w"] * r["facial_area"]["h"])
-        vec = np.asarray(rep["embedding"], dtype=np.float32)
-        n = float(np.linalg.norm(vec))
-        if n == 0:
-            raise HTTPException(status_code=500, detail=f"degenerate_descriptor_{label}")
-        return vec / n
+        # Detector cascade: retinaface (strongest) → mtcnn (catches small or
+        # rotated faces retinaface misses) → opencv (Haar cascade — fast and
+        # very forgiving on lower-quality scans). If all three give up we
+        # accept the verdict and surface no_face_<label> so the front end
+        # can show a face-detection-specific message instead of a fake "0%
+        # similarity" comparison.
+        #
+        # Why three backends: a real-world failure that was rejecting paying
+        # users — passport bio-page photos are physically smaller and often
+        # have security overlays/holograms that confuse RetinaFace's anchor
+        # boxes. MTCNN works on the same passport scan. INE photos are
+        # similarly tricky when laminated under glare. OpenCV's Haar cascade
+        # is the universal cheapest fallback (1990s tech, still robust on
+        # well-lit frontal faces). DeepFace ships all three — no extra deps.
+        last_err: str | None = None
+        for backend in ("retinaface", "mtcnn", "opencv"):
+            try:
+                reps = DeepFace.represent(
+                    img_path=img,
+                    model_name="ArcFace",
+                    detector_backend=backend,
+                    enforce_detection=True,
+                    align=True,
+                    normalization="ArcFace",
+                )
+            except Exception as e:
+                last_err = f"{backend}: {e}"
+                continue
+            if not reps:
+                last_err = f"{backend}: empty_reps"
+                continue
+            # Pick the largest face detected (handles multi-face frames safely).
+            rep = max(reps, key=lambda r: r["facial_area"]["w"] * r["facial_area"]["h"])
+            vec = np.asarray(rep["embedding"], dtype=np.float32)
+            n = float(np.linalg.norm(vec))
+            if n == 0:
+                last_err = f"{backend}: degenerate_descriptor"
+                continue
+            return vec / n
+        # All three detectors failed — genuinely no face here, or the image
+        # is too damaged. Log the trail of failures so we can tune later.
+        print(f"[verify_face] no_face_{label} after cascade: {last_err}")
+        raise HTTPException(status_code=422, detail=f"no_face_{label}")
 
     id_vec = descriptor(id_img, "id")
     selfie_vec = descriptor(selfie_img, "selfie")
