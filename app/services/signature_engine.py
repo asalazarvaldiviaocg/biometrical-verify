@@ -84,6 +84,26 @@ WEIGHT_STROKE_DENSITY = 0.10
 WEIGHT_ASPECT_RATIO   = 0.10
 WEIGHT_HAUSDORFF      = 0.10
 
+# Hard floors on the *discriminative* features (SSIM and HOG). The
+# weighted-additive score is generous on purpose — it has to absorb the
+# texture gap between a printed-on-paper signature and a finger-on-canvas
+# capture of the same person. But generosity has a cost: stroke density,
+# aspect ratio and Hausdorff all give "free" partial points whenever two
+# signatures happen to have similar ink quantity / proportions / outline
+# scale, even when the actual strokes are unrelated. A real-world report
+# from production: a signer drew a doodle that had nothing to do with
+# their passport signature and the gate accepted it because density +
+# aspect + Hausdorff alone pushed the additive score over threshold.
+#
+# These two floors short-circuit that. SSIM and HOG can't both be high
+# unless the strokes themselves overlap structurally — that's exactly
+# what the soft features can't fake. If either of them is below floor,
+# `match_pass` is forced to False regardless of the additive score; the
+# similarity number we surface to the operator stays unchanged so the
+# panel still shows the real measurement.
+SSIM_HARD_FLOOR = 0.20  # binarised images sharing zero stroke topology
+HOG_HARD_FLOOR  = 0.15  # local gradient orientations must overlap a bit
+
 
 @dataclass
 class SignatureMatchResult:
@@ -468,11 +488,24 @@ def compare_signatures(
     )
     similarity = int(max(0, min(100, round(combined * 100))))
 
+    # Hard floor on the discriminative features. Soft features (density,
+    # aspect, Hausdorff) can collude to fake a passing total even when
+    # SSIM/HOG show no real stroke overlap — that's how a doodle was
+    # passing through against a passport signature. Force fail when
+    # either discriminator is below floor; the surfaced similarity stays
+    # honest so the operator panel still shows what we measured.
+    discriminator_pass = (ssim_score >= SSIM_HARD_FLOOR) and (hog_score >= HOG_HARD_FLOOR)
+    match_pass = (similarity >= threshold) and discriminator_pass
+    reason = None if match_pass else (
+        "below_threshold" if not discriminator_pass else None
+    )
+
     return SignatureMatchResult(
         similarity=similarity, ssim_raw=ssim_raw,
-        match_pass=similarity >= threshold, threshold=threshold,
+        match_pass=match_pass, threshold=threshold,
         id_signature_found=True, canvas_signature_found=True,
         model=MODEL_NAME,
+        reason=reason,
     )
 
 

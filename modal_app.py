@@ -287,8 +287,17 @@ def verify_face(payload: dict, x_verify_auth: str = Header(default="")):
 # strokes / passport bio-page glare were getting flagged as no-match. Half
 # of the previous 75 threshold reduces false-rejects while the other layers
 # (face match, video consent, identity continuity, name OCR) absorb the
-# residual fraud risk. Re-tune up once we have a labelled production corpus.
-SIGNATURE_THRESHOLD = 37
+# residual fraud risk.
+#
+# v2 (50, this): production reported a doodle passing against a real
+# passport signature with the v1 threshold. The v5 multi-feature engine
+# already added hard floors on SSIM and HOG (the discriminative
+# features), but the raw threshold also needed a bump to keep additive
+# gaming harder. 50 still admits finger-on-canvas captures of the same
+# signer because the calibration curve in biometrical-contract maps
+# raw 50 → display ~70 — signers see a comfortable score, attackers
+# need real stroke overlap to hit it.
+SIGNATURE_THRESHOLD = 50
 
 
 @app.function(
