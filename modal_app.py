@@ -289,15 +289,18 @@ def verify_face(payload: dict, x_verify_auth: str = Header(default="")):
 # (face match, video consent, identity continuity, name OCR) absorb the
 # residual fraud risk.
 #
-# v2 (50, this): production reported a doodle passing against a real
-# passport signature with the v1 threshold. The v5 multi-feature engine
-# already added hard floors on SSIM and HOG (the discriminative
-# features), but the raw threshold also needed a bump to keep additive
-# gaming harder. 50 still admits finger-on-canvas captures of the same
-# signer because the calibration curve in biometrical-contract maps
-# raw 50 → display ~70 — signers see a comfortable score, attackers
-# need real stroke overlap to hit it.
-SIGNATURE_THRESHOLD = 50
+# v3 (40): real production calibration. v2's bump to 50 was based on a
+# theoretical distribution; live firmas legítimas (finger-on-canvas vs
+# printed-on-passport) actually peak around 45-48 because the texture
+# gap between the two capture media physically caps SSIM and HOG. With
+# the threshold at 50, a real signer trying to clear the gate against
+# their own passport would fail every time. We rely on the hard floors
+# in signature_engine.py (SSIM_HARD_FLOOR / HOG_HARD_FLOOR) to block
+# doodles regardless of the additive total — that's where fraud
+# protection lives now, not the threshold. The threshold's only job is
+# to set the *minimum total quality* a signer's strokes must reach;
+# 40 is the empirical floor for real captures of real signatures.
+SIGNATURE_THRESHOLD = 40
 
 
 @app.function(
