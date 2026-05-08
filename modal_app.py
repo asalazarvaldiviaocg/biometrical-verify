@@ -47,7 +47,7 @@ import os
 import modal
 from fastapi import Header, HTTPException
 
-APP_NAME = "biometrical-verify"
+APP_NAME = "biometrical-verify-v3"
 
 app = modal.App(APP_NAME)
 
