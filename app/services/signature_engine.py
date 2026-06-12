@@ -496,9 +496,19 @@ def compare_signatures(
     # honest so the operator panel still shows what we measured.
     discriminator_pass = (ssim_score >= SSIM_HARD_FLOOR) and (hog_score >= HOG_HARD_FLOOR)
     match_pass = (similarity >= threshold) and discriminator_pass
-    reason = None if match_pass else (
-        "below_threshold" if not discriminator_pass else None
-    )
+    # Surface a DISTINCT, correctly-labelled reason for each failure mode so
+    # the audit trail can tell a deliberate doodle from an honest poor match:
+    #   - discriminator floor failed (SSIM/HOG ~0) => the canvas shares no real
+    #     stroke structure with the printed signature (doodle / unrelated mark)
+    #   - similarity below threshold but floors OK => a genuine but weak match
+    # The previous code attached "below_threshold" to the floor-fail branch and
+    # left a real threshold reject with reason=None — exactly inverted.
+    if match_pass:
+        reason = None
+    elif not discriminator_pass:
+        reason = "discriminator_floor"
+    else:
+        reason = "below_threshold"
 
     return SignatureMatchResult(
         similarity=similarity, ssim_raw=ssim_raw,

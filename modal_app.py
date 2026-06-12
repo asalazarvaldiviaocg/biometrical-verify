@@ -424,7 +424,13 @@ def verify_signature(payload: dict, x_verify_auth: str = Header(default="")):
 # without running into Modal's 120 s function timeout for very long
 # uploads.
 _LIVENESS_FRAME_SAMPLES = 6
-# Per-frame floor — matches the OSS engine's default LIVENESS_PASS_THRESHOLD.
+# Per-frame floor for the BLE anti-spoof score. NOTE: this is a deliberate,
+# stricter-than-engine-default value. The engine's own LIVENESS_PASS_THRESHOLD
+# is 0.35 ("ship-now permissive") with 0.55-0.65 documented as the
+# post-calibration target; we apply the stricter 0.55 here as a hard gate.
+# Trade-off: stronger anti-spoof, but real users whose fused BLE score lands
+# in [0.35, 0.55) are rejected. Re-tune (up or down) against a labelled
+# corpus of real selfies + attacks before treating this number as final.
 _LIVENESS_PASS_THRESHOLD = 0.55
 # Aggregate floor — 60 % of analyzed frames must pass. Looser than per-frame
 # alone (a single bad frame from a real signer doesn't fail the recording)
