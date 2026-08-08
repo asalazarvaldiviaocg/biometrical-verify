@@ -19,7 +19,7 @@ from datetime import UTC, datetime, timedelta
 
 import cv2
 import numpy as np
-from celery.exceptions import SoftTimeLimitExceeded
+from celery.exceptions import MaxRetriesExceededError, SoftTimeLimitExceeded
 
 from app.core.config import get_settings
 from app.core.logging import get_logger
@@ -178,9 +178,15 @@ def verify_identity_task(self, job_id: str) -> dict:
                 verification_id=job_id, event="error", detail={"error": str(e)[:500]}
             ))
             db.commit()
+        # self.retry() raises celery.exceptions.Retry (itself an Exception
+        # subclass) to hand the message back to the broker for another attempt.
+        # A blanket `except Exception` here would SWALLOW that Retry — the task
+        # would return a success payload, the message would be acked, and
+        # max_retries would be dead. Let Retry propagate; only convert the
+        # terminal MaxRetriesExceededError into a final error result.
         try:
             raise self.retry(exc=e, countdown=10)
-        except Exception:
+        except MaxRetriesExceededError:
             return {"status": "error", "reason": str(e)}
 
     finally:

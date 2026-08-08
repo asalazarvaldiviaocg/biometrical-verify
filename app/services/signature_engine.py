@@ -274,9 +274,9 @@ def _hog_cosine(a: np.ndarray, b: np.ndarray) -> float:
     """
     if a.shape != b.shape:
         return 0.0
-    # Block-normalised HOG with 8×8 cells / 2×2 cell blocks. Generous
-    # cell size keeps the descriptor short (~hundred floats) and
-    # robust to the natural 1-2 px stroke jitter between signatures.
+    # Block-normalised HOG with 16×16 cells / 2×2 cell blocks. Generous
+    # cell size keeps the descriptor compact and robust to the natural
+    # 1-2 px stroke jitter between two captures of the same signature.
     fd_a = hog(a, orientations=9, pixels_per_cell=(16, 16), cells_per_block=(2, 2),
                block_norm='L2-Hys', feature_vector=True)
     fd_b = hog(b, orientations=9, pixels_per_cell=(16, 16), cells_per_block=(2, 2),
@@ -300,8 +300,6 @@ def _stroke_density_similarity(bin_a: np.ndarray, bin_b: np.ndarray) -> float:
     """
     pix_a = float(np.count_nonzero(bin_a == 0))
     pix_b = float(np.count_nonzero(bin_b == 0))
-    if pix_a == 0 and pix_b == 0:
-        return 0.0
     if pix_a == 0 or pix_b == 0:
         return 0.0
     rel_diff = abs(pix_a - pix_b) / max(pix_a, pix_b)

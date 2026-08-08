@@ -38,3 +38,6 @@ tmp/
 
 # Docker
 docker-data/
+
+# graphify knowledge-graph output (local analysis only)
+graphify-out/

@@ -42,7 +42,9 @@ Secrets required (already created by setup):
 
 from __future__ import annotations
 
+import hmac
 import os
+import re
 
 import modal
 from fastapi import Header, HTTPException
@@ -122,11 +124,17 @@ MATCH_THRESHOLD = 35
 #      This is the load-bearing protection against the "callers control
 #      the S3 key" threat. Permissive shape + size cap > narrow shape
 #      + no size cap, because the size cap is what actually matters.
-import re as _re
-_S3_KEY_RE = _re.compile(r"^[A-Za-z0-9._/-]{1,512}$")
+# `\Z` (not `$`) so a trailing newline can't slip a control char past the
+# class — `$` matches before a final `\n`, `\Z` anchors the true end.
+_S3_KEY_RE = re.compile(r"^[A-Za-z0-9._/-]{1,512}\Z")
 _MAX_IMAGE_BYTES = 8 * 1024 * 1024   # 8 MB per ID / selfie still
 _MAX_SIG_B64_LEN = (8 * 1024 * 1024 * 4) // 3  # ≈ 8 MB decoded
 _MAX_VIDEO_BYTES = 30 * 1024 * 1024  # 30 MB per liveness video (6s @ ~1080p)
+# Decompression-bomb guard: cap the DECODED pixel count. The byte caps above
+# bound the compressed payload, but a highly-compressible PNG (uniform color)
+# can expand to a multi-gigapixel array inside cv2.imdecode and OOM the worker.
+# A real ID/selfie is well under this; 50 MP ≈ an 8000×6250 image.
+_MAX_DECODED_PIXELS = 50 * 1024 * 1024
 
 
 def _validate_key(label: str, key: str) -> None:
@@ -134,23 +142,48 @@ def _validate_key(label: str, key: str) -> None:
         raise HTTPException(status_code=422, detail=f"invalid_{label}_key")
     # Reject relative-path traversal even when each path segment passes
     # the character class (a string like "a/../b" would otherwise slip
-    # through). Doubles as a guard against `//` collapses, leading `/`,
-    # leading `.` (hidden files), and trailing `/` (directory refs).
-    if ".." in key or key.startswith("/") or key.startswith(".") or key.endswith("/"):
+    # through). Also reject `//` collapses, leading `/`, leading `.`
+    # (hidden files), and trailing `/` (directory refs).
+    if (
+        ".." in key or "//" in key
+        or key.startswith("/") or key.startswith(".") or key.endswith("/")
+    ):
         raise HTTPException(status_code=422, detail=f"invalid_{label}_key")
 
 
-def _check_size(s3_client, bucket: str, label: str, key: str, cap: int) -> None:
+def _auth_ok(x_verify_auth: str) -> bool:
+    """Constant-time shared-secret check. `hmac.compare_digest` avoids the
+    byte-by-byte short-circuit of `==`, which is timing-observable on these
+    public endpoints."""
+    expected = os.environ.get("SHARED_SECRET", "")
+    if not expected:
+        return False
+    return hmac.compare_digest(x_verify_auth, expected)
+
+
+def _fetch_capped(s3_client, bucket: str, label: str, key: str, cap: int) -> bytes:
+    """GET the object and enforce the size cap from the SAME response's
+    ContentLength before reading the body — one round trip, no TOCTOU gap
+    between a separate HEAD and the GET, and no cap-bypass when a backend
+    omits ContentLength on HEAD. Raw botocore errors are logged, not returned,
+    so bucket/key/existence metadata never leaks in the HTTP body."""
     try:
-        head = s3_client.head_object(Bucket=bucket, Key=key)
+        obj = s3_client.get_object(Bucket=bucket, Key=key)
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"s3_head_failed_{label}: {exc}") from exc
-    size = int(head.get("ContentLength") or 0)
-    if size > cap:
+        print(f"[s3_fetch_failed] {label} {key}: {exc}")
+        raise HTTPException(status_code=502, detail=f"s3_fetch_failed_{label}") from exc
+    declared = obj.get("ContentLength")
+    if declared is not None and int(declared) > cap:
         raise HTTPException(
             status_code=413,
-            detail=f"{label}_too_large ({size} bytes; max {cap})",
+            detail=f"{label}_too_large ({int(declared)} bytes; max {cap})",
         )
+    # Read at most cap+1 bytes so a missing/lying ContentLength still can't
+    # stream an unbounded body into the worker.
+    body = obj["Body"].read(cap + 1)
+    if len(body) > cap:
+        raise HTTPException(status_code=413, detail=f"{label}_too_large (>{cap} bytes)")
+    return body
 
 
 @app.function(
@@ -163,8 +196,7 @@ def _check_size(s3_client, bucket: str, label: str, key: str, cap: int) -> None:
 )
 @modal.fastapi_endpoint(method="POST", docs=False)
 def verify_face(payload: dict, x_verify_auth: str = Header(default="")):
-    expected = os.environ.get("SHARED_SECRET", "")
-    if not expected or x_verify_auth != expected:
+    if not _auth_ok(x_verify_auth):
         raise HTTPException(status_code=401, detail="invalid auth")
 
     id_key = payload.get("id_image_key") or ""
@@ -196,26 +228,17 @@ def verify_face(payload: dict, x_verify_auth: str = Header(default="")):
         aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
     )
 
-    def fetch(key: str, label: str) -> bytes:
-        # head_object first to enforce a size cap before pulling the body.
-        # Without this a multi-hundred-MB object would OOM-kill the 4 GiB
-        # worker — possible because callers control the S3 key.
-        _check_size(s3, bucket, label, key, _MAX_IMAGE_BYTES)
-        try:
-            obj = s3.get_object(Bucket=bucket, Key=key)
-            return obj["Body"].read()
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"s3_fetch_failed: {exc}") from exc
-
     def decode(b: bytes) -> np.ndarray:
         arr = np.frombuffer(b, dtype=np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if img is None:
             raise HTTPException(status_code=422, detail="image_decode_failed")
+        if img.shape[0] * img.shape[1] > _MAX_DECODED_PIXELS:
+            raise HTTPException(status_code=413, detail="image_too_large_decoded")
         return img
 
-    id_img = decode(fetch(id_key, "id_image"))
-    selfie_img = decode(fetch(selfie_key, "selfie_image"))
+    id_img = decode(_fetch_capped(s3, bucket, "id_image", id_key, _MAX_IMAGE_BYTES))
+    selfie_img = decode(_fetch_capped(s3, bucket, "selfie_image", selfie_key, _MAX_IMAGE_BYTES))
 
     def descriptor(img: np.ndarray, label: str) -> np.ndarray:
         # Detector cascade: retinaface (strongest) → mtcnn (catches small or
@@ -281,8 +304,9 @@ def verify_face(payload: dict, x_verify_auth: str = Header(default="")):
 # Compares the canvas signature drawn by the signer against the printed
 # signature on the back of their INE/IFE. HARD GATE on the contract side —
 # below el threshold, biometrical-contract devuelve 422 'below_threshold' y
-# bloquea el flujo después de 5 intentos. Calibrado con SSIM + Hu Moments
-# (modelo ssim+humoments+otsu-v2).
+# bloquea el flujo después de 5 intentos. Motor multi-feature v5 (SSIM + Hu
+# Moments + HOG + stroke density + aspect ratio + Hausdorff; ver
+# signature_engine.MODEL_NAME).
 #
 # v1 ship-now permissive (37): legitimate signers with poor lighting / fast
 # strokes / passport bio-page glare were getting flagged as no-match. Half
@@ -327,14 +351,13 @@ def verify_signature(payload: dict, x_verify_auth: str = Header(default="")):
       {
         "similarity": 64,                  # 0–100, higher = more similar
         "ssim": 0.42,                      # raw SSIM in [-1, 1]
-        "match_pass": true,                # similarity >= threshold
-        "threshold": 60,
+        "match_pass": true,                # similarity >= threshold AND floors
+        "threshold": 40,
         "id_signature_found": true,        # false if no signature blob detected
-        "model": "ssim+otsu-v1"
+        "model": "ssim+hu+hog+stroke+aspect+hausdorff-v5"
       }
     """
-    expected = os.environ.get("SHARED_SECRET", "")
-    if not expected or x_verify_auth != expected:
+    if not _auth_ok(x_verify_auth):
         raise HTTPException(status_code=401, detail="invalid auth")
 
     id_back_key = payload.get("id_back_image_key") or ""
@@ -376,14 +399,8 @@ def verify_signature(payload: dict, x_verify_auth: str = Header(default="")):
         aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
     )
 
-    # head_object size cap — same rationale as verify_face's fetch().
-    _check_size(s3, bucket, "id_back_image", id_back_key, _MAX_IMAGE_BYTES)
-
-    try:
-        obj = s3.get_object(Bucket=bucket, Key=id_back_key)
-        id_back_bytes = obj["Body"].read()
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"s3_fetch_failed: {exc}") from exc
+    # Single GET with an inline size cap — same rationale as verify_face.
+    id_back_bytes = _fetch_capped(s3, bucket, "id_back_image", id_back_key, _MAX_IMAGE_BYTES)
 
     try:
         result = compare_signatures_b64(
@@ -437,6 +454,18 @@ _LIVENESS_PASS_THRESHOLD = 0.55
 # but tight enough that a still-photo replay can't pass (texture is constant
 # so all frames pass-or-fail together).
 _LIVENESS_PASS_RATIO_MIN = 0.60
+# Minimum number of face-bearing frames we must actually analyze before the
+# pass_ratio is meaningful. Without this, a video where only 1 of 6 sampled
+# frames has a detectable face collapses to pass_ratio over n=1 — a single
+# lucky printed-photo flash frame scores is_live=True. Fewer than this ⇒ we
+# can't render an anti-spoof verdict, so we surface no_face_in_video (which
+# the contract treats as a non-fatal skip, same as a Modal outage).
+_LIVENESS_MIN_ANALYZED = 3
+# Minimum real frame count for a usable liveness clip (~0.4 s at 30 fps).
+_LIVENESS_MIN_TOTAL_FRAMES = 12
+# Hard cap on the linear-walk counting pass so a pathological/huge upload
+# can't spin the CPU unbounded (30 MB video cap already bounds this loosely).
+_LIVENESS_MAX_WALK_FRAMES = 3000
 
 
 @app.function(
@@ -467,8 +496,7 @@ def verify_liveness(payload: dict, x_verify_auth: str = Header(default="")):
 
     Response (4xx) on auth failure / decode failure / no face found.
     """
-    expected = os.environ.get("SHARED_SECRET", "")
-    if not expected or x_verify_auth != expected:
+    if not _auth_ok(x_verify_auth):
         raise HTTPException(status_code=401, detail="invalid auth")
 
     video_key = payload.get("liveness_video_key") or ""
@@ -480,12 +508,10 @@ def verify_liveness(payload: dict, x_verify_auth: str = Header(default="")):
     if not bucket:
         raise HTTPException(status_code=500, detail="bucket not configured")
 
-    import os as _os
     import tempfile
 
     import boto3
     import cv2
-    import numpy as np
     from deepface import DeepFace
     from app.services.biometrical_liveness_engine import analyze
 
@@ -496,19 +522,13 @@ def verify_liveness(payload: dict, x_verify_auth: str = Header(default="")):
         aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
     )
 
-    _check_size(s3, bucket, "liveness_video", video_key, _MAX_VIDEO_BYTES)
-    try:
-        obj = s3.get_object(Bucket=bucket, Key=video_key)
-        video_bytes = obj["Body"].read()
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"s3_fetch_failed: {exc}") from exc
+    video_bytes = _fetch_capped(s3, bucket, "liveness_video", video_key, _MAX_VIDEO_BYTES)
 
     # cv2.VideoCapture needs a real filesystem path; raw bytes don't work.
-    # Suffix matters — Modal's libavformat sniffs container format from
-    # extension when the magic bytes aren't conclusive.
-    suffix = ".webm"
-    if video_key.endswith(".mp4") or video_bytes[4:8] == b"ftyp":
-        suffix = ".mp4"
+    # Suffix only helps ffmpeg when magic bytes are inconclusive; WebM (EBML)
+    # and MP4 (ftyp box) both probe conclusively by content, so a stable
+    # default with an mp4 override is enough.
+    suffix = ".mp4" if (video_key.endswith(".mp4") or video_bytes[4:8] == b"ftyp") else ".webm"
 
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
         tmp.write(video_bytes)
@@ -519,25 +539,43 @@ def verify_liveness(payload: dict, x_verify_auth: str = Header(default="")):
         if not cap.isOpened():
             raise HTTPException(status_code=422, detail="video_decode_failed")
 
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        # Some webm streams report 0 frames despite being decodable; in that
-        # case we walk the stream linearly and pick every Nth frame instead
-        # of seeking by index.
-        if total_frames < 12:
+        # Frame count: MediaRecorder WebM routinely reports 0/-1 for
+        # CAP_PROP_FRAME_COUNT because live-recorded Matroska carries no
+        # duration/cues, and CAP_PROP_POS_FRAMES seeks are unreliable on VP8/VP9
+        # even when a count IS reported. So we NEVER trust the metadata count or
+        # index seeks: we count real frames with a cheap grab()-only pass (no
+        # decode), then linear-walk a second time, decoding only at the sample
+        # positions. This is the "walk the stream linearly" behavior the old
+        # code promised in a comment but never implemented (it just 422'd every
+        # cues-less webm as video_too_short, silently disabling the gate).
+        real_total = 0
+        while real_total <= _LIVENESS_MAX_WALK_FRAMES and cap.grab():
+            real_total += 1
+        if real_total < _LIVENESS_MIN_TOTAL_FRAMES:
             cap.release()
             raise HTTPException(status_code=422, detail="video_too_short")
 
-        sample_indices = [
-            int(total_frames * (i + 0.5) / _LIVENESS_FRAME_SAMPLES)
+        # Reopen — the counting pass consumed the stream.
+        cap.release()
+        cap = cv2.VideoCapture(tmp_path)
+        if not cap.isOpened():
+            raise HTTPException(status_code=422, detail="video_decode_failed")
+
+        sample_positions = {
+            int(real_total * (i + 0.5) / _LIVENESS_FRAME_SAMPLES)
             for i in range(_LIVENESS_FRAME_SAMPLES)
-        ]
+        }
 
         per_frame: list[dict] = []
-        for idx in sample_indices:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-            ok, frame = cap.read()
+        pos = -1
+        while cap.grab():
+            pos += 1
+            if pos not in sample_positions:
+                continue
+            ok, frame = cap.retrieve()
             if not ok or frame is None:
                 continue
+            idx = pos
 
             # Detect face — opencv backend is the cheapest detector and
             # works fine on selfie frames (frontal face, well lit by the
@@ -583,11 +621,16 @@ def verify_liveness(payload: dict, x_verify_auth: str = Header(default="")):
         cap.release()
     finally:
         try:
-            _os.unlink(tmp_path)
+            os.unlink(tmp_path)
         except Exception:
             pass
 
-    if not per_frame:
+    # A verdict needs enough face-bearing frames to be meaningful. With too
+    # few, pass_ratio is dominated by one or two frames and a single lucky
+    # spoof frame passes — so we decline to render a verdict and let the
+    # contract soft-skip (same non-fatal path as an outage) rather than
+    # emit an attackable is_live=True.
+    if len(per_frame) < _LIVENESS_MIN_ANALYZED:
         raise HTTPException(status_code=422, detail="no_face_in_video")
 
     avg_score = sum(p["score"] for p in per_frame) / len(per_frame)
