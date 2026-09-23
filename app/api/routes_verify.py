@@ -222,3 +222,47 @@ async def get_verification(
         created_at=rec.created_at.isoformat() if rec.created_at else None,
         finished_at=rec.finished_at.isoformat() if rec.finished_at else None,
     )
+
+
+# ---------- id-quality ----------
+
+@router.post(
+    "/id-quality",
+    status_code=status.HTTP_200_OK,
+)
+async def id_quality(
+    id_image: UploadFile = File(...),
+    user: CurrentUser = Depends(rate_limit(bucket="challenge")),
+    db: Session = Depends(get_db),
+):
+    """Lightweight ID quality check for Laundex onboarding Continue gate.
+    Returns verified if the image is a readable photo of an ID (face present,
+    sharp enough, no blinding reflection), otherwise 422 with a machine-readable
+    reason code (no_face | too_blurry | glare) Laundex maps to user guidance.
+    Uses the same id_parser as the full pipeline, so the hosted KYC is the
+    single source of truth."""
+    id_bytes = await _read_capped(id_image, _settings.max_id_bytes)
+    _check_mime(id_bytes, id_image.content_type, ALLOWED_IMG, "id_image")
+    from app.services import id_parser
+    q = id_parser.assess(id_bytes)
+    if not q.acceptable:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            {
+                "code": q.reason,
+                "reasons": q.reasons,
+                "message": _id_quality_message(q.reason),
+                "notes": q.notes,
+            },
+        )
+    return {"status": "verified", "notes": q.notes, "acceptable": True}
+
+
+def _id_quality_message(reason: str) -> str:
+    from app.services import id_parser
+
+    if reason == id_parser.REASON_TOO_BLURRY:
+        return "ID photo too blurry — hold steady in good light and retake it."
+    if reason == id_parser.REASON_GLARE:
+        return "Reflection on the ID — tilt it away from direct light and retake it."
+    return "No face found on the ID — upload a clear photo of a real ID."
