@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     # DB / cache
     database_url: str = "postgresql+psycopg://bio:bio@db:5432/bio"
     redis_url: str = "redis://redis:6379/0"
+    # Full-text OCR sidecar for the AI-garble screen (VPC-only, same trust
+    # boundary as the bio DB/Redis/MinIO). Best-effort: unreachable sidecar
+    # skips the garble signal, never blocks the pipeline.
+    ocr_sidecar_url: str = "http://10.138.0.3:8001"
 
     # Object store
     s3_endpoint: str = "http://minio:9000"
