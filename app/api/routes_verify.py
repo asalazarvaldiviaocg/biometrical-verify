@@ -266,3 +266,52 @@ def _id_quality_message(reason: str) -> str:
     if reason == id_parser.REASON_GLARE:
         return "Reflection on the ID — tilt it away from direct light and retake it."
     return "No face found on the ID — upload a clear photo of a real ID."
+
+
+# ---------- bill-match ----------
+
+_SAFE_NAME = re.compile(r"^[A-Za-z][A-Za-z '\-]{1,99}$")
+
+
+@router.post(
+    "/bill-match",
+    status_code=status.HTTP_200_OK,
+)
+async def bill_match(
+    bill_image: UploadFile = File(...),
+    full_name: str = Form(..., min_length=2, max_length=100),
+    user: CurrentUser = Depends(rate_limit(bucket="challenge")),
+    db: Session = Depends(get_db),
+):
+    """Utility-bill name verdict for guarantor reachability proof (Laundex
+    calls this at guarantor submission). OCRs the bill via the sidecar and
+    checks the guarantor's name appears on it. Returns verified or
+    manual_review with a note — never a rejection: OCR misreads are routine.
+    Image bills only; PDFs and unreadable images route to manual_review."""
+    if not _SAFE_NAME.match(full_name):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Invalid full_name")
+    bill_bytes = await _read_capped(bill_image, _settings.max_id_bytes)
+    try:
+        _check_mime(bill_bytes, bill_image.content_type, ALLOWED_IMG, "bill_image")
+    except HTTPException as e:
+        return {"status": "manual_review", "note": f"bill not a readable image ({e.detail})"}
+    import httpx as _httpx
+
+    from app.services import bill_match as _bm
+
+    try:
+        async with _httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                _settings.ocr_sidecar_url.rstrip("/") + "/text",
+                files={"file": ("bill.jpg", bill_bytes, "image/jpeg")},
+            )
+        if resp.status_code != 200:
+            raise ValueError(f"sidecar status {resp.status_code}")
+        lines = resp.json().get("text_lines")
+        if not isinstance(lines, list):
+            raise ValueError("sidecar bad response")
+    except Exception as e:
+        log.info("bill_match_sidecar_skip", err=str(e)[:120])
+        return {"status": "manual_review", "note": "bill OCR unavailable - admin review"}
+    verified, note = _bm.match_bill_name([str(l) for l in lines], full_name)
+    return {"status": "verified" if verified else "manual_review", "note": note}
