@@ -42,3 +42,28 @@ def test_single_token_manual():
 def test_empty_manual():
     ok, note = bm.match_bill_name([], "Cedric Akuetteh Mensa Odonkor")
     assert not ok and note
+
+
+def test_id_name_match_verifies():
+    ocr = ["ECOWAS IDENTITY CARD", "ODONKOR<<CEDRIC<AKUETTEH<MENSA",
+           "REPUBLIC OF GHANA"]
+    ok, note = bm.match_id_name(ocr, "Cedric Mensa Odonkor")
+    assert ok and note == ""
+
+
+def test_id_name_single_glyph_tolerance():
+    # OCR misread one letter of the surname and no exact copy exists:
+    # still the same name via single-edit tolerance.
+    ok, _ = bm.match_id_name(["ODONKAR<<CEDRIC"], "Cedric Odonkor")
+    assert ok
+
+
+def test_id_name_mismatch_manual():
+    ok, note = bm.match_id_name(
+        ["ODONKOR<<CEDRIC<AKUETTEH<MENSA"], "Ama Serwaa")
+    assert not ok and "match" in note
+
+
+def test_id_name_empty_manual():
+    ok, _ = bm.match_id_name([], "Cedric Odonkor")
+    assert not ok

@@ -315,3 +315,75 @@ async def bill_match(
         return {"status": "manual_review", "note": "bill OCR unavailable - admin review"}
     verified, note = _bm.match_bill_name([str(l) for l in lines], full_name)
     return {"status": "verified" if verified else "manual_review", "note": note}
+
+
+# ---------- guarantor-card ----------
+
+@router.post("/guarantor-card")
+async def guarantor_card(
+    card_front_image: UploadFile = File(...),
+    card_back_image: UploadFile = File(...),
+    full_name: str = Form(..., min_length=2, max_length=100),
+    user: CurrentUser = Depends(rate_limit(bucket="challenge")),
+    db: Session = Depends(get_db),
+):
+    """Guarantor card verdict (Laundex calls this at guarantor submission so
+    the ID number is service-extracted, never user-typed).
+
+    - Front must pass the ID-quality gate or the whole call 422s with the
+      specific reason code (same contract as /id-quality).
+    - The typed full_name must match the name printed on the card (front
+      OCR, single-glyph tolerance) or name is manual_review.
+    - The back MRZ lines are returned raw; ICAO parsing stays in Laundex.
+    Response 200: {"card": "verified", "name": "verified"|"manual_review",
+    "name_note": str, "mrz_lines": [...]}."""
+    import httpx as _httpx
+
+    from app.services import bill_match as _bm
+    from app.services import id_parser
+
+    if not _SAFE_NAME.match(full_name):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Invalid full_name")
+    front_bytes = await _read_capped(card_front_image, _settings.max_id_bytes)
+    _check_mime(front_bytes, card_front_image.content_type, ALLOWED_IMG, "card_front_image")
+    back_bytes = await _read_capped(card_back_image, _settings.max_id_bytes)
+    _check_mime(back_bytes, card_back_image.content_type, ALLOWED_IMG, "card_back_image")
+
+    q = id_parser.assess(front_bytes)
+    if not q.acceptable:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            {
+                "code": q.reason,
+                "reasons": q.reasons,
+                "message": _id_quality_message(q.reason),
+                "notes": q.notes,
+            },
+        )
+
+    async def _post(endpoint: str, filename: str, payload: bytes) -> list | None:
+        try:
+            async with _httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    _settings.ocr_sidecar_url.rstrip("/") + endpoint,
+                    files={"file": (filename, payload, "image/jpeg")},
+                )
+            if resp.status_code != 200:
+                return None
+            data = resp.json().get("text_lines" if endpoint == "/text" else "mrz_lines")
+            return data if isinstance(data, list) else None
+        except Exception as e:
+            log.info("guarantor_card_sidecar_skip", endpoint=endpoint, err=str(e)[:120])
+            return None
+
+    front_lines = await _post("/text", "front.jpg", front_bytes) or []
+    mrz_lines = await _post("/ocr", "back.jpg", back_bytes) or []
+    name_ok, name_note = _bm.match_id_name(
+        [str(l) for l in front_lines] + [str(l) for l in mrz_lines], full_name
+    )
+    return {
+        "card": "verified",
+        "name": "verified" if name_ok else "manual_review",
+        "name_note": name_note,
+        "mrz_lines": [str(l) for l in mrz_lines],
+    }
