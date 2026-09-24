@@ -10,12 +10,13 @@ Signals (calibrated Sep 2026 on the live box):
   highest-precision synthetic-ID signal available without GPU classifiers.
 - structural: card quadrilateral aspect (~1.586 for ID-1), text-row count,
   face-inside-card. AI layouts drift; screen photos of real cards pass.
-- spectral_hf / noise_residual: RECORDED ONLY. Measured Sep 2026 on real
-  captures (hf 0.947-0.957), a screen-photo fake (0.954) and pure StyleGAN3
-  faces (0.958): whole-image spectra do NOT separate camera from synthetic
-  at this scale. No threshold is applied — the numbers land in the audit
-  event so a future classifier can be tuned on observed data. Shipping a
-  cutoff here would be security theatre.
+- spectral_hf / noise_residual: RECORDED ONLY. Measured Sep 2026 over real
+  captures, screen-photo fakes, pure StyleGAN3 faces and diffusion mockups:
+  all groups overlap (hf 0.945-0.973, noise interleaved). Whole-image spectra
+  do NOT separate camera from synthetic at this scale. No threshold is
+  applied — the numbers land in the audit event so a future classifier can
+  be tuned on observed data. Shipping a cutoff here would be security
+  theatre.
 """
 
 from __future__ import annotations
@@ -29,10 +30,13 @@ import numpy as np
 # ID-1 card aspect (85.60 x 53.98 mm) with tolerance for perspective + crop.
 CARD_ASPECT = 85.60 / 53.98
 CARD_ASPECT_TOL = 0.18
-# Text-row peaks in the horizontal edge profile. Calibrated Sep 2026:
-# real card photos 16-27, blank/heavily-blurred 0. Below 5 means no
-# readable row structure at all.
-MIN_TEXT_PEAKS = 5
+# Text-row peaks in the horizontal edge profile. Calibrated Sep 2026 over
+# 10 samples (kyc /tmp calibration set): real card photos 16-27, sample
+# cards 9-16, diffusion portrait 5, blank/heavily-blurred 0. Below 8 means
+# no readable document structure at all (blank, blur, or a bare face photo
+# submitted as an ID). Review-only, so the thin margin on tiny samples is
+# safe: worst case a human glances.
+MIN_TEXT_PEAKS = 8
 
 # Garble screen: AI-generated IDs garble microtext into consonant soup.
 # wordlike_ratio = vowel-containing, sane-consonant-run tokens / all alpha
