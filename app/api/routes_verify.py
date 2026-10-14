@@ -381,9 +381,31 @@ async def guarantor_card(
     name_ok, name_note = _bm.match_id_name(
         [str(l) for l in front_lines] + [str(l) for l in mrz_lines], full_name
     )
+    # Counts only - never the name, never the card text. This exists because the
+    # next failure of this check should be diagnosable from a log line instead of
+    # from reproducing a card someone else photographed. "matched 1 of 3" says
+    # immediately that the reading worked and the rule did not fire; "matched 0
+    # of 2" says the card was not read at all. Without them both presented as
+    # the same thing - "name does not match" - and that ambiguity is what made
+    # this take a round trip to diagnose.
+    _typed_tokens = len([t for t in _bm._norm(full_name).split() if len(t) >= _bm._NAME_TOKEN_MIN])
+    _matched = len(_bm._matched_tokens(
+        [t for t in _bm._norm(full_name).split() if len(t) >= _bm._NAME_TOKEN_MIN],
+        _bm._norm("\n".join([str(l) for l in front_lines] + [str(l) for l in mrz_lines])).split(),
+    ))
+    log.info(
+        "guarantor_card_name_verdict",
+        verified=name_ok,
+        matched=_matched,
+        typed=_typed_tokens,
+        front_lines=len(front_lines),
+        mrz_lines=len(mrz_lines),
+    )
     return {
         "card": "verified",
         "name": "verified" if name_ok else "manual_review",
         "name_note": name_note,
+        "name_matched": _matched,
+        "name_typed": _typed_tokens,
         "mrz_lines": [str(l) for l in mrz_lines],
     }
