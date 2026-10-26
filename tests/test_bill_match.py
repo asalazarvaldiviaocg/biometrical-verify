@@ -152,3 +152,98 @@ def test_the_note_says_what_actually_happened():
     _, wrong = bm.match_id_name(["AMENYO", "GHANA CARD"], "Kofi Mensah")
     assert "did not match" in wrong.lower() or "does not match" in wrong.lower()
     assert "read" not in wrong.lower()
+
+
+# ---------------------------------------------------------------------------
+# The grade: verified, mismatch, unclear.
+#
+# A count cannot carry the difference between "this card carries a different
+# name" and "this photograph could not be read well enough to say". One of two
+# names matched is the same number in both cases, so a caller reading only the
+# count has to guess - and guessing wrong means refusing a person whose card is
+# in their hand, or accepting a card that belongs to somebody else.
+#
+# The grade is the difference, and it can only be computed here: this is where
+# the card text is.
+# ---------------------------------------------------------------------------
+
+
+def test_the_card_carries_the_name_so_it_verifies():
+    status, note = bm.grade_id_name(
+        ["ODONKOR<<CEDRIC<AKUETTEH<MENSA"], "Cedric Odonkor")
+    assert status == bm.NAME_VERIFIED, note
+
+
+def test_a_name_the_card_does_not_carry_is_a_mismatch():
+    """Nothing of the typed name is on a card we could read."""
+    status, note = bm.grade_id_name(
+        ["ODONKOR<<CEDRIC<AKUETTEH<MENSA"], "Kwadwo Mensah")
+    assert status == bm.NAME_MISMATCH, note
+
+
+def test_one_name_on_the_card_and_one_absent_is_a_mismatch():
+    """The case that had no answer at all.
+
+    "Cedric" is on the card and the surname the person typed is not. That is
+    somebody else's card, and it was indistinguishable from a surname the OCR
+    had mangled - the same "1 of 2 matched" in both cases. One of those is a
+    fact about the document and the other is a fact about a photograph.
+    """
+    status, note = bm.grade_id_name(
+        ["ODONKOR<<CEDRIC<AKUETTEH<MENSA"], "Cedric Asare")
+    assert status == bm.NAME_MISMATCH, note
+
+
+def test_a_mangled_surname_is_unclear_not_a_mismatch():
+    """The same shape, but the surname on the card was read badly - two edits
+    from what was typed. The card carries the name; the machine did not read
+    it. A person decides that one."""
+    status, note = bm.grade_id_name(["CEDRIC", "MENSHA"], "Cedric Mensah")
+    assert status == bm.NAME_UNCLEAR, note
+
+
+def test_a_suffix_the_person_typed_is_not_a_wrong_name():
+    """"Jnr" is not on the card because the card does not carry suffixes. It is
+    three letters long, which is also too short to call a name absent: ABI,
+    NANA and AMA are ordinary names, and a short token that is missing is far
+    more likely to be a suffix than a false name."""
+    status, note = bm.grade_id_name(["KWADWO", "MENSAH"], "Kwadwo Jnr")
+    assert status == bm.NAME_UNCLEAR, note
+
+
+def test_a_card_we_could_not_read_is_unclear():
+    """Not a mismatch. We did not read the card; we know nothing about what is
+    on it."""
+    status, note = bm.grade_id_name([], "Kofi Mensah")
+    assert status == bm.NAME_UNCLEAR, note
+    assert "read" in note.lower()
+
+
+def test_a_one_token_name_the_card_does_not_carry_is_a_mismatch():
+    """Long enough to mean something. "Kofi" is not on that card."""
+    status, note = bm.grade_id_name(["MENSAH", "GHANA CARD"], "Kofi")
+    assert status == bm.NAME_MISMATCH, note
+
+
+def test_a_one_token_name_too_short_to_judge_is_unclear():
+    """"Ama" is three letters. The card may carry it and the machine may have
+    read it badly; that is not a fact about the document."""
+    status, note = bm.grade_id_name(["MENSAH", "GHANA CARD"], "Ama")
+    assert status == bm.NAME_UNCLEAR, note
+
+
+def test_a_one_token_name_that_is_on_the_card_is_unclear_not_verified():
+    """The bar is two names, and one name cannot reach it. That is a name this
+    check cannot grade, not a wrong name."""
+    status, note = bm.grade_id_name(["Kofi", "GHANA CARD"], "Kofi")
+    assert status == bm.NAME_UNCLEAR, note
+
+
+def test_the_grade_never_echoes_the_name():
+    """Counts and grades only. The response and the logs must never carry the
+    person's name."""
+    status, note = bm.grade_id_name(
+        ["ODONKOR<<CEDRIC<AKUETTEH<MENSA"], "Cedric Asare")
+    assert status == bm.NAME_MISMATCH
+    assert "CEDRIC" not in note.upper()
+    assert "ASARE" not in note.upper()

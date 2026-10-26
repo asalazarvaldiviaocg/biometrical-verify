@@ -7,7 +7,7 @@ full name, decides verified vs manual_review.
 utility bill is a formal document with its own conventions and the surname is
 the stable part of it.
 
-`match_id_name` verified on any two tokens, because an identity card does not
+`grade_id_name` verified on any two tokens, because an identity card does not
 follow the person's typing convention and the old surname requirement refused
 real guarantors for a suffix, a hyphen, or the order the card printed. See its
 docstring.
@@ -16,12 +16,32 @@ Everything else - OCR noise, abbreviated documents, married names, unreadable
 images - is manual_review with a note naming which case it was, NEVER a
 rejection: OCR misreads are routine and a machine must not strand a real
 guarantor.
+
+The one thing the caller needs on top of that is the difference between a name
+that is plainly NOT on the document and a name the machine could not read well
+enough to judge. Those are facts about different things - the document and the
+photograph - and they have different consequences: the first is something the
+person can act on by correcting what they typed, the second is something only a
+person can decide. `grade_id_name` grades the name three ways so the caller
+never has to infer that difference from a count.
 """
 
 from __future__ import annotations
 
 import re
 
+
+# The three grades a name can come back with.
+#
+# verified - the card carries the person's name.
+# mismatch - the card was read and carries a DIFFERENT name.
+# unclear  - the card could not be read well enough to say either way.
+#
+# Only `mismatch` is a fact about the document, so only `mismatch` may refuse
+# anybody. `unclear` is a fact about a photograph.
+NAME_VERIFIED = "verified"
+NAME_MISMATCH = "mismatch"
+NAME_UNCLEAR = "unclear"
 
 _NAME_TOKEN_MIN = 3
 # Single-glyph tolerance starts at four characters, not five. KOFI, AMA, YAW,
@@ -40,6 +60,20 @@ _GLYPH_TOLERANCE_MIN = 4
 # on the card and was still refused, in front of an applicant who could do
 # nothing about it.
 _REQUIRED_MATCHES = 2
+# A token shorter than this is never judged absent.
+#
+# ABI, NANA, AMA and JNR are ordinary given names and suffixes. A short token
+# that is not on the card is far more likely to be a suffix the person typed
+# than a false name, and refusing on it turned away people who were carrying
+# their own card. Long enough to mean something, or it goes to a person.
+_ABSENCE_MIN_LEN = 4
+# How many edits a card token may be from a typed name and still be that name,
+# mangled by the OCR rather than replaced by a different one.
+#
+# One edit is a misread. Two is a transposition or a doubled stroke. Three is
+# where a name stops being the same name: past it, the card does not carry
+# what the person typed, and that is a fact about the document.
+_NEAR_MISS_MAX = 3
 
 
 def _norm(s: str) -> str:
@@ -73,6 +107,33 @@ def _lev1(a: str, b: str) -> bool:
     return prev[-1] <= 1
 
 
+def _lev_n(a: str, b: str, limit: int) -> int:
+    """Edit distance between a and b, capped at limit + 1.
+
+    Anything further apart than limit is reported as limit + 1, because the
+    only question asked of it is whether the two are within limit of each
+    other. The band keeps the cost proportional to the limit rather than to
+    the length of the names.
+    """
+    if a == b:
+        return 0
+    if abs(len(a) - len(b)) > limit:
+        return limit + 1
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        row_min = i
+        for j, cb in enumerate(b, 1):
+            cost = 0 if ca == cb else 1
+            v = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            cur.append(v)
+            row_min = min(row_min, v)
+        if row_min > limit:
+            return limit + 1
+        prev = cur
+    return prev[-1]
+
+
 def _matched_tokens(want: list[str], hay_tokens: list[str]) -> list[str]:
     """Which of the typed name tokens appear in the OCR text.
 
@@ -85,6 +146,21 @@ def _matched_tokens(want: list[str], hay_tokens: list[str]) -> list[str]:
         if any(tok == h or _lev1(tok, h) for h in hay_tokens if len(h) >= _NAME_TOKEN_MIN):
             matched.append(tok)
     return matched
+
+
+def _near_miss(tok: str, hay_tokens: list[str]) -> bool:
+    """Is this typed name on the card, mangled by the OCR rather than replaced?
+
+    A near miss means the card probably carries the name and the machine read
+    it badly - a person's call, never a refusal. No near miss means the card
+    does not carry it, which is a fact about the document.
+    """
+    for h in hay_tokens:
+        if len(h) < _ABSENCE_MIN_LEN:
+            continue
+        if _lev_n(tok, h, _NEAR_MISS_MAX) <= _NEAR_MISS_MAX:
+            return True
+    return False
 
 
 def match_bill_name(bill_lines: list[str], full_name: str) -> tuple[bool, str]:
@@ -106,41 +182,78 @@ def match_bill_name(bill_lines: list[str], full_name: str) -> tuple[bool, str]:
     return False, "partial name match on the bill - admin review"
 
 
-def match_id_name(ocr_lines: list[str], full_name: str) -> tuple[bool, str]:
-    """Typed-name vs ID-printed-name check for guarantor acceptance.
+def grade_id_name(ocr_lines: list[str], full_name: str) -> tuple[str, str]:
+    """Grade a typed name against an ID card: verified, mismatch or unclear.
 
     Verified when at least two of the typed name's tokens are on the card,
     each exact or one misread glyph off. Nothing else gates it: not which token
     is last, not whether the surname specifically appeared. Which token a person
     types last is a naming convention, not a fact about who they are, and
-    requiring it refused real guarantors for using a suffix, a hyphen, or the
-    order the card happened to print.
+    requiring it refused real people for using a suffix, a hyphen, or the order
+    the card happened to print.
 
-    Every other outcome is manual_review with a note that says which one it was.
-    The distinction matters to the person reading it: "we could not read the
-    card" means retake the photo, "the names did not match" means check the
-    spelling, and reporting the second when the truth is the first sends people
-    to fix something that was never wrong.
+    The grade below that line is the one the caller needs:
 
-    NEVER a rejection. A guarantor is somebody vouching for a stranger, with
-    nothing to gain and every reason to walk away; a machine that turns a misread
-    into a refusal does not lose an applicant, it loses the vouch.
+    mismatch - the card was read, and it does not carry the name that was
+        typed. One of the typed names is not on the card at all, and it is not
+        there misread either - it is simply absent. This is a fact about the
+        document, and the person can act on it by typing the name their card
+        actually carries.
+
+    unclear - the card could not be read well enough to say. The name may be
+        there and misread (a near miss), it may be shorter than the bar for
+        judging absence, it may be a suffix the person typed, or nothing may
+        have been read at all. None of those is a fact about the document, and
+    a person decides those.
+
+    The distinction is the whole point of this function. A count cannot carry
+    it: "one of two names matched" is the same number whether the second name
+    was misread or is somebody else's, and a caller reading only that number
+    has to guess - and guessing wrong means either refusing a person whose
+    card is in their hand, or accepting a card that belongs to somebody else.
     """
     want = [t for t in _norm(full_name).split() if len(t) >= _NAME_TOKEN_MIN]
     if not want:
-        return False, "guarantor name has no matchable tokens - admin review"
+        return NAME_UNCLEAR, "guarantor name has no matchable tokens - admin review"
     hay = _norm("\n".join(ocr_lines)).split()
     if not hay:
-        return False, "could not read the name on the ID - admin review"
+        return NAME_UNCLEAR, "could not read the name on the ID - admin review"
 
     matched = _matched_tokens(want, hay)
     if len(matched) >= _REQUIRED_MATCHES:
-        return True, ""
+        return NAME_VERIFIED, ""
 
-    if not matched:
-        return False, "the name on the ID did not match - admin review"
-    return (
-        False,
+    missing = [t for t in want if t not in matched]
+    if not missing:
+        # Every typed name is on the card, but there are fewer than two of them
+        # to compare: a one-token name cannot reach the bar. That is not a
+        # mismatch, it is a name this check cannot grade.
+        return NAME_UNCLEAR, (
+            f"only {len(matched)} of {len(want)} names on the ID matched "
+            f"({_REQUIRED_MATCHES} needed) - admin review"
+        )
+
+    # Some of the names are on the card and some are not. The question that
+    # decides this case is whether the missing name is there but misread, or is
+    # simply not on the card.
+    absent = [
+        t for t in missing
+        if len(t) >= _ABSENCE_MIN_LEN and not _near_miss(t, hay)
+    ]
+    if absent:
+        return NAME_MISMATCH, "the name on the ID did not match - admin review"
+    return NAME_UNCLEAR, (
         f"only {len(matched)} of {len(want)} names on the ID matched "
-        f"({len(matched)} needed) - admin review",
+        f"({_REQUIRED_MATCHES} needed) - admin review"
     )
+
+
+def match_id_name(ocr_lines: list[str], full_name: str) -> tuple[bool, str]:
+    """Typed-name vs ID-printed-name check, as a yes/no.
+
+    Kept for callers that only need "is this verified". The grade is
+    `grade_id_name`'s, and the notes are the ones it produces, so a caller
+    reading this still learns whether the name was wrong or merely unread.
+    """
+    status, note = grade_id_name(ocr_lines, full_name)
+    return status == NAME_VERIFIED, note

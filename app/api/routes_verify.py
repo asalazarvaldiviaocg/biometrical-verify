@@ -336,7 +336,14 @@ async def guarantor_card(
       OCR, single-glyph tolerance) or name is manual_review.
     - The back MRZ lines are returned raw; ICAO parsing stays in Laundex.
     Response 200: {"card": "verified", "name": "verified"|"manual_review",
-    "name_note": str, "mrz_lines": [...]}."""
+    "name_status": "verified"|"mismatch"|"unclear", "name_note": str,
+    "mrz_lines": [...]}.
+
+    name_status is the grade, and it is the part a caller acts on: "mismatch"
+    is a fact about the document (the card carries a different name), while
+    "unclear" is a fact about the photograph (it could not be read well enough
+    to say). "name" stays the two-way grade for callers that only need to know
+    whether the name was confirmed."""
     import httpx as _httpx
 
     from app.services import bill_match as _bm
@@ -378,7 +385,7 @@ async def guarantor_card(
 
     front_lines = await _post("/text", "front.jpg", front_bytes) or []
     mrz_lines = await _post("/ocr", "back.jpg", back_bytes) or []
-    name_ok, name_note = _bm.match_id_name(
+    name_status, name_note = _bm.grade_id_name(
         [str(l) for l in front_lines] + [str(l) for l in mrz_lines], full_name
     )
     # Counts only - never the name, never the card text. This exists because the
@@ -395,7 +402,8 @@ async def guarantor_card(
     ))
     log.info(
         "guarantor_card_name_verdict",
-        verified=name_ok,
+        verified=(name_status == _bm.NAME_VERIFIED),
+        status=name_status,
         matched=_matched,
         typed=_typed_tokens,
         front_lines=len(front_lines),
@@ -403,7 +411,8 @@ async def guarantor_card(
     )
     return {
         "card": "verified",
-        "name": "verified" if name_ok else "manual_review",
+        "name": "verified" if name_status == _bm.NAME_VERIFIED else "manual_review",
+        "name_status": name_status,
         "name_note": name_note,
         "name_matched": _matched,
         "name_typed": _typed_tokens,

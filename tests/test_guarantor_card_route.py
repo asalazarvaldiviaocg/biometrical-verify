@@ -225,3 +225,49 @@ def test_the_response_says_how_many_names_matched(
     assert body["name_typed"] == 2
     # The whole point: no name is echoed back into a response or a log.
     assert "KWADWO" not in str(body).upper()
+
+
+def test_the_response_carries_the_grade_the_caller_acts_on(
+    client, auth_headers, acceptable_card, ocr_says
+):
+    """The grade is the difference between "this card carries a different name"
+    and "this photograph could not be read well enough to say". The caller acts
+    on the first and queues the second, and it cannot tell them apart from the
+    counts: one of two names matched is the same number in both cases."""
+    ocr_says(front=["CEDRIC", "ODONKOR"], back=[])
+
+    r = post_card(client, auth_headers, "Cedric Asare")
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["name_status"] == "mismatch", body
+    # The two-way grade stays, for callers that only need to know whether the
+    # name was confirmed.
+    assert body["name"] == "manual_review", body
+
+
+def test_an_unreadable_card_is_graded_unclear_not_mismatch(
+    client, auth_headers, acceptable_card, ocr_says
+):
+    """Nothing was read, so nothing is known about what the card carries."""
+    ocr_says(front=[], back=[])
+
+    r = post_card(client, auth_headers, "Kofi Mensah")
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["name_status"] == "unclear", body
+    assert body["name"] == "manual_review", body
+
+
+def test_a_matching_name_is_graded_verified(
+    client, auth_headers, acceptable_card, ocr_says
+):
+    ocr_says(front=["CEDRIC", "ODONKOR"], back=[])
+
+    r = post_card(client, auth_headers, "Cedric Odonkor")
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["name_status"] == "verified", body
+    assert body["name"] == "verified", body
