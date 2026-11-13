@@ -195,3 +195,24 @@ def test_jwt_rejects_unsafe_subject():
     with TestClient(app) as c:
         r = c.get("/api/v1/verify/challenge", headers={"Authorization": f"Bearer {token}"})
     assert r.status_code == 401
+
+
+def test_readyz_detects_an_unmigrated_schema(monkeypatch):
+    """A database that answers SELECT 1 but is missing its tables is the worst
+    state: every probe passes, every route that writes 500s, and readiness
+    says ready. That is what an engine booted without `alembic upgrade head`
+    did - the API in front of it answered 502 while its own health check
+    called the engine healthy, so the probe below fails on schema alone."""
+    from app.api import routes_health
+
+    def _boom():
+        raise RuntimeError("no migrations applied: alembic_version is empty")
+
+    monkeypatch.setattr(routes_health, "_probe_schema", _boom)
+    with TestClient(app) as c:
+        r = c.get("/readyz")
+    assert r.status_code == 503
+    body = r.json()
+    assert body["checks"]["schema"]["ok"] is False
+    assert "no migrations applied" in body["checks"]["schema"]["error"]
+    assert body["status"] != "ready"
