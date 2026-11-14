@@ -26,7 +26,7 @@ from app.core.logging import get_logger
 from app.core.security import sign_receipt
 from app.db.session import SessionLocal
 from app.models.verification import AuditEvent, Verification
-from app.services import deepfake, face_engine, id_parser, liveness, nonce_store
+from app.services import deepfake, doc_forensics, face_engine, id_parser, liveness, nonce_store
 from app.services.crypto_vault import UserKekRevoked, purge_revoked_user_keks
 from app.services.storage import BlobRef, load_encrypted_blob
 from app.workers.celery_app import celery
@@ -49,11 +49,17 @@ def _decide(
     match_verified: bool,
     is_live: bool,
     df_suspicious: bool,
+    review_reasons: list[str] | None = None,
 ) -> tuple[str, str]:
     if df_suspicious:
         return "REJECT", "Deepfake heuristics triggered"
     if not is_live:
         return "REJECT", "Liveness check failed"
+    # Forensic advisory flags (duplicate image, garbled text, off-template
+    # geometry) never reject — they cap the outcome at REVIEW for a human.
+    # REJECT paths above are unaffected.
+    if review_reasons:
+        return "REVIEW", "Forensics review: " + "; ".join(review_reasons)
     # APPROVE requires BOTH the model-author threshold (distance ≤ 0.68 for
     # ArcFace on LFW) AND our configured similarity floor. Previously the
     # decision used only `similarity ≥ 0.40`, which approves matches that
@@ -64,6 +70,74 @@ def _decide(
     if similarity >= _settings.review_similarity_min:
         return "REVIEW", "Borderline similarity — manual review"
     return "REJECT", "Similarity below review threshold"
+
+
+def _sidecar_text_lines(id_bytes: bytes) -> list[str] | None:
+    """Full-document OCR via the sidecar for the AI-garble screen.
+    Best-effort: None on any failure — the garble signal is skipped, the
+    pipeline continues. Never raises."""
+    try:
+        import httpx
+
+        resp = httpx.post(
+            _settings.ocr_sidecar_url.rstrip("/") + "/text",
+            files={"file": ("id.jpg", id_bytes, "image/jpeg")},
+            timeout=30.0,
+        )
+        if resp.status_code != 200:
+            return None
+        lines = resp.json().get("text_lines")
+        return lines if isinstance(lines, list) else None
+    except Exception as e:
+        log.info("forensics_sidecar_skip", err=str(e)[:120])
+        return None
+
+
+def _doc_forensics_review(db, record: Verification, id_bytes: bytes) -> list[str]:
+    """Run document forensics, persist phash + audit, return REVIEW reasons.
+    Advisory only — an empty list means no flags, never a pass/fail."""
+    reasons: list[str] = []
+    try:
+        rep = doc_forensics.analyse(id_bytes)
+    except Exception as e:
+        log.info("forensics_analyse_skip", err=str(e)[:120])
+        return reasons
+    record.id_phash = rep.phash
+    db.flush()
+    # Near-duplicate ID image under a different account: reused AI output or
+    # shared fraud-ring photo. Hamming <= 6 ~ same image (recompression-proof).
+    try:
+        dup = (
+            db.query(Verification.id, Verification.user_id)
+            .filter(
+                Verification.id_phash == rep.phash,
+                Verification.user_id != record.user_id,
+                Verification.status == "done",
+            )
+            .first()
+        )
+        if dup is not None:
+            reasons.append(
+                f"possible duplicate ID image (also on account {dup.user_id})"
+            )
+    except Exception as e:
+        log.info("forensics_dup_skip", err=str(e)[:120])
+    reasons.extend(rep.reasons)
+    garble_detail: dict = {}
+    lines = _sidecar_text_lines(id_bytes)
+    if lines is not None:
+        flagged, ratio, n = doc_forensics.is_garbled(lines)
+        garble_detail = {"wordlike_ratio": round(ratio, 3), "tokens": n}
+        if flagged:
+            reasons.append(
+                f"ID text reads as garbled (wordlike {ratio:.2f} over {n} tokens) — possible AI-generated document"
+            )
+    db.add(AuditEvent(
+        verification_id=record.id, event="doc_forensics",
+        detail={**rep.to_public(), "garble": garble_detail,
+                "duplicate_checked": True},
+    ))
+    return reasons
 
 
 @celery.task(
@@ -121,6 +195,11 @@ def verify_identity_task(self, job_id: str) -> dict:
                 deepfake_suspicious=None, model=None,
             )
 
+        # Document forensics (AI-generated / reused ID screens). Advisory:
+        # flags cap the verdict at REVIEW, never reject. Runs right after
+        # the ID-quality gate so the audit trail reads in order.
+        forensics_reasons = _doc_forensics_review(db, record, id_bytes)
+
         # Persist video to a temp file for OpenCV / MediaPipe
         with tempfile.NamedTemporaryFile(suffix=".bin", delete=False) as tf:
             tf.write(vid_bytes)
@@ -145,7 +224,7 @@ def verify_identity_task(self, job_id: str) -> dict:
 
         decision, reason = _decide(
             match.similarity, match.distance, match.verified,
-            live.is_live, df.suspicious,
+            live.is_live, df.suspicious, forensics_reasons,
         )
 
         return _finalise(

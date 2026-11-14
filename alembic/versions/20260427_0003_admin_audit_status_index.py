@@ -17,6 +17,8 @@ from __future__ import annotations
 import sqlalchemy as sa
 from alembic import op
 
+from app.alembic_idem import add_column, create_index, create_table
+
 revision: str = "0003_admin_audit_status_index"
 down_revision: str | None = "0002_user_keks_and_nonces"
 branch_labels = None
@@ -24,7 +26,7 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.create_table(
+    create_table(
         "admin_audit_events",
         sa.Column("id", sa.String(36), primary_key=True),
         sa.Column("actor", sa.String(64), nullable=False, index=True),
@@ -43,7 +45,7 @@ def upgrade() -> None:
     # Sweeper-friendly composite index: the requeue-stuck-verifications task
     # filters by (status='queued', created_at < cutoff). PG can use this even
     # without statistics on freshly seeded data.
-    op.create_index(
+    create_index(
         "ix_verifications_status_created",
         "verifications",
         ["status", "created_at"],

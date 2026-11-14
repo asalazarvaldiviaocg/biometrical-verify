@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import os
+from pathlib import Path
 
 from fastapi import APIRouter, Response, status
-from sqlalchemy import text
+from sqlalchemy import inspect, text
+
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 
 from app import __version__
+from app.models.base import Base
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.db.session import engine
@@ -26,6 +31,47 @@ async def healthz() -> dict:
 def _probe_db() -> None:
     with engine.connect() as conn:
         conn.execute(text("SELECT 1"))
+
+
+_ALEMBIC_INI = Path(__file__).resolve().parents[2] / "alembic.ini"
+
+
+def _probe_schema() -> str:
+    """Return the database's current alembic revision, or raise.
+
+    A database that answers SELECT 1 but is missing its tables is the worst
+    state this service can be in: every other probe below passes, every route
+    that writes 500s, and readiness reports ready. That is not hypothetical -
+    the engine booted without `alembic upgrade head` answered /healthz and
+    /readyz with ready while every challenge insert failed on a missing
+    issued_nonces table, and the API in front of it answered 502 for
+    something its own health check called healthy.
+    """
+    with engine.connect() as conn:
+        row = conn.execute(text("SELECT version_num FROM alembic_version LIMIT 1")).first()
+        present = set(inspect(conn).get_table_names())
+    current = row[0] if row else None
+    if not current:
+        raise RuntimeError("no migrations applied: alembic_version is empty")
+    # The version row is not the schema. On the KYC box the row read at head
+    # while the tables were gone - every probe, including this one, said
+    # healthy, and the first challenge insert would have 500'd. The models
+    # are the expected schema, so compare against them: self-maintaining, and
+    # it catches exactly the state that just happened (tables dropped
+    # underneath a current version row, where the idempotency guards never
+    # run because alembic has nothing left to apply).
+    missing = sorted(set(Base.metadata.tables) - present)
+    if missing:
+        raise RuntimeError(
+            f"alembic_version says {current} but these tables are missing: {missing} "
+            "- re-stamp the version row and re-run upgrade head"
+        )
+    return current
+
+
+def _head_revisions() -> list[str]:
+    cfg = Config(str(_ALEMBIC_INI))
+    return ScriptDirectory.from_config(cfg).get_heads()
 
 
 def _probe_redis() -> None:
@@ -68,6 +114,19 @@ async def readyz(response: Response) -> dict:
         overall_ok = False
         checks["db"] = {"ok": False, "error": str(e)[:120]}
 
+    # Schema: the database is reachable AND migrated to head. Connectivity
+    # alone is the probe that had nothing to say about an empty schema.
+    try:
+        revision = await asyncio.to_thread(_probe_schema)
+        heads = await asyncio.to_thread(_head_revisions)
+        at_head = revision in heads
+        checks["schema"] = {"ok": at_head, "revision": revision, "head": ",".join(heads)}
+        if not at_head:
+            overall_ok = False
+    except Exception as e:
+        overall_ok = False
+        checks["schema"] = {"ok": False, "error": str(e)[:120]}
+
     # Redis
     try:
         await asyncio.to_thread(_probe_redis)
@@ -84,13 +143,26 @@ async def readyz(response: Response) -> dict:
         overall_ok = False
         checks["object_store"] = {"ok": False, "error": str(e)[:120]}
 
-    # Anti-spoof model — in production its absence falls back to a sharpness
-    # heuristic that approves printed photos. Treat as fatal there.
+    # Anti-spoof model file — INFORMATIONAL, and deliberately not fatal.
+    #
+    # Nothing in the pipeline loads this file: the liveness path is the
+    # proprietary multi-signal engine in services/biometrical_liveness_engine.py
+    # (OpenCV + NumPy, no pre-trained weights), and grepping the runtime for
+    # onnxruntime finds exactly one hit - this probe. Treating it as fatal in
+    # production readied-out a service whose liveness never needed it, which
+    # is how the KYC box spent weeks reporting ok:false for a file no code
+    # path opens.
+    #
+    # It stays reported so a future engine that DOES load a model cannot lose
+    # the check silently: a note distinguishes "absent and unused" from
+    # "absent while something depends on it".
     model_path = s.anti_spoof_model_path
     model_present = await asyncio.to_thread(_probe_model_present, model_path)
-    checks["anti_spoof_model"] = {"ok": model_present, "path": model_path}
-    if s.is_prod and not model_present:
-        overall_ok = False
+    checks["anti_spoof_model"] = {
+        "ok": model_present,
+        "path": model_path,
+        "note": "loaded_by_pipeline=false; liveness runs the multi-signal engine",
+    }
 
     if not overall_ok:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE

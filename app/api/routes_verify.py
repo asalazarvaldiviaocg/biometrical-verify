@@ -222,3 +222,224 @@ async def get_verification(
         created_at=rec.created_at.isoformat() if rec.created_at else None,
         finished_at=rec.finished_at.isoformat() if rec.finished_at else None,
     )
+
+
+# ---------- id-quality ----------
+
+@router.post(
+    "/id-quality",
+    status_code=status.HTTP_200_OK,
+)
+async def id_quality(
+    id_image: UploadFile = File(...),
+    user: CurrentUser = Depends(rate_limit(bucket="challenge")),
+    db: Session = Depends(get_db),
+):
+    """Lightweight ID quality check for Laundex onboarding Continue gate.
+    Returns verified if the image is a readable photo of an ID (face present,
+    sharp enough, no blinding reflection), otherwise 422 with a machine-readable
+    reason code (no_face | too_blurry | glare) Laundex maps to user guidance.
+    Uses the same id_parser as the full pipeline, so the hosted KYC is the
+    single source of truth."""
+    id_bytes = await _read_capped(id_image, _settings.max_id_bytes)
+    _check_mime(id_bytes, id_image.content_type, ALLOWED_IMG, "id_image")
+    from app.services import id_parser
+    try:
+        q = id_parser.assess(id_bytes)
+    except ValueError as _e:
+        # Unreadable bytes are a fact about the upload, not an outage: answer the
+        # quality contract (422 + reason) so the caller can tell the applicant
+        # their photograph is unreadable instead of reporting a server error.
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            {
+                "code": "unreadable",
+                "reasons": ["unreadable"],
+                "message": _id_quality_message("unreadable"),
+                "notes": str(_e)[:200],
+            },
+        )
+    if not q.acceptable:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            {
+                "code": q.reason,
+                "reasons": q.reasons,
+                "message": _id_quality_message(q.reason),
+                "notes": q.notes,
+            },
+        )
+    return {"status": "verified", "notes": q.notes, "acceptable": True}
+
+
+def _id_quality_message(reason: str) -> str:
+    from app.services import id_parser
+
+    if reason == id_parser.REASON_TOO_BLURRY:
+        return "ID photo too blurry — hold steady in good light and retake it."
+    if reason == id_parser.REASON_GLARE:
+        return "Reflection on the ID — tilt it away from direct light and retake it."
+    return "No face found on the ID — upload a clear photo of a real ID."
+
+
+# ---------- bill-match ----------
+
+_SAFE_NAME = re.compile(r"^[A-Za-z][A-Za-z '\-]{1,99}$")
+
+
+@router.post(
+    "/bill-match",
+    status_code=status.HTTP_200_OK,
+)
+async def bill_match(
+    bill_image: UploadFile = File(...),
+    full_name: str = Form(..., min_length=2, max_length=100),
+    user: CurrentUser = Depends(rate_limit(bucket="challenge")),
+    db: Session = Depends(get_db),
+):
+    """Utility-bill name verdict for guarantor reachability proof (Laundex
+    calls this at guarantor submission). OCRs the bill via the sidecar and
+    checks the guarantor's name appears on it. Returns verified or
+    manual_review with a note — never a rejection: OCR misreads are routine.
+    Image bills only; PDFs and unreadable images route to manual_review."""
+    if not _SAFE_NAME.match(full_name):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Invalid full_name")
+    bill_bytes = await _read_capped(bill_image, _settings.max_id_bytes)
+    try:
+        _check_mime(bill_bytes, bill_image.content_type, ALLOWED_IMG, "bill_image")
+    except HTTPException as e:
+        return {"status": "manual_review", "note": f"bill not a readable image ({e.detail})"}
+    import httpx as _httpx
+
+    from app.services import bill_match as _bm
+
+    try:
+        async with _httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                _settings.ocr_sidecar_url.rstrip("/") + "/text",
+                files={"file": ("bill.jpg", bill_bytes, "image/jpeg")},
+            )
+        if resp.status_code != 200:
+            raise ValueError(f"sidecar status {resp.status_code}")
+        lines = resp.json().get("text_lines")
+        if not isinstance(lines, list):
+            raise ValueError("sidecar bad response")
+    except Exception as e:
+        log.info("bill_match_sidecar_skip", err=str(e)[:120])
+        return {"status": "manual_review", "note": "bill OCR unavailable - admin review"}
+    verified, note = _bm.match_bill_name([str(l) for l in lines], full_name)
+    return {"status": "verified" if verified else "manual_review", "note": note}
+
+
+# ---------- guarantor-card ----------
+
+@router.post("/guarantor-card")
+async def guarantor_card(
+    card_front_image: UploadFile = File(...),
+    card_back_image: UploadFile = File(...),
+    full_name: str = Form(..., min_length=2, max_length=100),
+    user: CurrentUser = Depends(rate_limit(bucket="challenge")),
+    db: Session = Depends(get_db),
+):
+    """Guarantor card verdict (Laundex calls this at guarantor submission so
+    the ID number is service-extracted, never user-typed).
+
+    - Front must pass the ID-quality gate or the whole call 422s with the
+      specific reason code (same contract as /id-quality).
+    - The typed full_name must match the name printed on the card (front
+      OCR, single-glyph tolerance) or name is manual_review.
+    - The back MRZ lines are returned raw; ICAO parsing stays in Laundex.
+    Response 200: {"card": "verified", "name": "verified"|"manual_review",
+    "name_status": "verified"|"mismatch"|"unclear", "name_note": str,
+    "mrz_lines": [...]}.
+
+    name_status is the grade, and it is the part a caller acts on: "mismatch"
+    is a fact about the document (the card carries a different name), while
+    "unclear" is a fact about the photograph (it could not be read well enough
+    to say). "name" stays the two-way grade for callers that only need to know
+    whether the name was confirmed."""
+    import httpx as _httpx
+
+    from app.services import bill_match as _bm
+    from app.services import id_parser
+
+    if not _SAFE_NAME.match(full_name):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "Invalid full_name")
+    front_bytes = await _read_capped(card_front_image, _settings.max_id_bytes)
+    _check_mime(front_bytes, card_front_image.content_type, ALLOWED_IMG, "card_front_image")
+    back_bytes = await _read_capped(card_back_image, _settings.max_id_bytes)
+    _check_mime(back_bytes, card_back_image.content_type, ALLOWED_IMG, "card_back_image")
+
+    try:
+        q = id_parser.assess(front_bytes)
+    except ValueError as _e:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            {
+                "code": "unreadable",
+                "reasons": ["unreadable"],
+                "message": _id_quality_message("unreadable"),
+                "notes": str(_e)[:200],
+            },
+        )
+    if not q.acceptable:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            {
+                "code": q.reason,
+                "reasons": q.reasons,
+                "message": _id_quality_message(q.reason),
+                "notes": q.notes,
+            },
+        )
+
+    async def _post(endpoint: str, filename: str, payload: bytes) -> list | None:
+        try:
+            async with _httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    _settings.ocr_sidecar_url.rstrip("/") + endpoint,
+                    files={"file": (filename, payload, "image/jpeg")},
+                )
+            if resp.status_code != 200:
+                return None
+            data = resp.json().get("text_lines" if endpoint == "/text" else "mrz_lines")
+            return data if isinstance(data, list) else None
+        except Exception as e:
+            log.info("guarantor_card_sidecar_skip", endpoint=endpoint, err=str(e)[:120])
+            return None
+
+    front_lines = await _post("/text", "front.jpg", front_bytes) or []
+    mrz_lines = await _post("/ocr", "back.jpg", back_bytes) or []
+    name_status, name_note = _bm.grade_id_name(
+        [str(l) for l in front_lines] + [str(l) for l in mrz_lines], full_name
+    )
+    # Counts only - never the name, never the card text. This exists because the
+    # next failure of this check should be diagnosable from a log line instead of
+    # from reproducing a card someone else photographed. "matched 1 of 3" says
+    # immediately that the reading worked and the rule did not fire; "matched 0
+    # of 2" says the card was not read at all. Without them both presented as
+    # the same thing - "name does not match" - and that ambiguity is what made
+    # this take a round trip to diagnose.
+    _typed_tokens = len([t for t in _bm._norm(full_name).split() if len(t) >= _bm._NAME_TOKEN_MIN])
+    _matched = len(_bm._matched_tokens(
+        [t for t in _bm._norm(full_name).split() if len(t) >= _bm._NAME_TOKEN_MIN],
+        _bm._norm("\n".join([str(l) for l in front_lines] + [str(l) for l in mrz_lines])).split(),
+    ))
+    log.info(
+        "guarantor_card_name_verdict",
+        verified=(name_status == _bm.NAME_VERIFIED),
+        status=name_status,
+        matched=_matched,
+        typed=_typed_tokens,
+        front_lines=len(front_lines),
+        mrz_lines=len(mrz_lines),
+    )
+    return {
+        "card": "verified",
+        "name": "verified" if name_status == _bm.NAME_VERIFIED else "manual_review",
+        "name_status": name_status,
+        "name_note": name_note,
+        "name_matched": _matched,
+        "name_typed": _typed_tokens,
+        "mrz_lines": [str(l) for l in mrz_lines],
+    }

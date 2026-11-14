@@ -11,7 +11,11 @@ services:
       minio:
         condition: service_healthy
     ports:
-      - "8000:8000"
+      # The address is configurable so a host can bind the engine to its
+      # internal address only (BIO_BIND=10.138.0.3), keeping it off the
+      # public interface even if a firewall rule ever opens. The default is
+      # unchanged for the upstream deployment model.
+      - "${BIO_BIND:-0.0.0.0}:8000:8000"
     volumes:
       - ./app:/srv/app:ro
       - ./alembic:/srv/alembic:ro

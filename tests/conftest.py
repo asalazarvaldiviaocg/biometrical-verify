@@ -88,6 +88,30 @@ def db_session():
         db.close()
 
 
+@pytest.fixture(autouse=True)
+def _reset_rate_limits():
+    """Clear the rate-limiter's per-process buckets between tests.
+
+    The limiter keys on `(bucket, user_id, minute)` and, with no Redis in CI,
+    falls back to a module-level dict that outlives any single test. Every test
+    mints the same token for the same fake user, so without this the suite
+    spends its budget on whatever ran first and later tests get a 429 they did
+    nothing to earn.
+
+    It showed up as three unrelated failures in test_routes.py after
+    test_guarantor_card_route.py was added, which is the worst shape a test can
+    break in: the new file passes, and three files that were green go red for a
+    reason no reader would connect to it. Order-independence is the fix, and it
+    has to live in conftest because no single spec file can undo what it does to
+    the others.
+    """
+    from app.api import deps
+
+    deps._fallback.clear()
+    yield
+    deps._fallback.clear()
+
+
 @pytest.fixture
 def jwt_token(settings):
     from app.core.security import create_access_token

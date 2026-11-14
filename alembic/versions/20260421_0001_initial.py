@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import sqlalchemy as sa
 from alembic import op
+
+from app.alembic_idem import add_column, create_index, create_table
 from sqlalchemy.dialects import postgresql
 
 revision: str = "0001_initial"
@@ -17,7 +19,7 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.create_table(
+    create_table(
         "verifications",
         sa.Column("id", postgresql.UUID(as_uuid=False), primary_key=True),
         sa.Column("user_id", sa.String(64), nullable=False, index=True),
@@ -45,11 +47,11 @@ def upgrade() -> None:
         ),
         sa.Column("finished_at", sa.DateTime(timezone=True), nullable=True),
     )
-    op.create_index(
+    create_index(
         "ix_verifications_user_status", "verifications", ["user_id", "status"]
     )
 
-    op.create_table(
+    create_table(
         "audit_events",
         sa.Column("id", postgresql.UUID(as_uuid=False), primary_key=True),
         sa.Column(
@@ -65,7 +67,7 @@ def upgrade() -> None:
             server_default=sa.text("now()"), nullable=False,
         ),
     )
-    op.create_index("ix_audit_events_verification_id", "audit_events", ["verification_id"])
+    create_index("ix_audit_events_verification_id", "audit_events", ["verification_id"])
 
 
 def downgrade() -> None:

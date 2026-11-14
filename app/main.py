@@ -18,6 +18,11 @@ log = get_logger(__name__)
 async def lifespan(app: FastAPI):
     settings = get_settings()
     log.info("startup", env=settings.app_env, version=__version__)
+    # Accepted trade-offs are logged on every start, not written down once:
+    # the person reading this log at 3am needs to know the master key is on
+    # this box without going to read the config diff that decided it.
+    for caution in settings.cautions:
+        log.warning("config caution", detail=caution)
     yield
     log.info("shutdown")
 

@@ -44,6 +44,11 @@ class Verification(Base):
     sha_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     sha_video: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
+    # DCT perceptual hash of the ID image for cross-account duplicate
+    # detection (reused AI-generated IDs, shared fraud-ring photos).
+    # Nullable: rows predating the forensics stage have none.
+    id_phash: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+
     similarity: Mapped[float | None] = mapped_column(Float, nullable=True)
     distance: Mapped[float | None] = mapped_column(Float, nullable=True)
     threshold: Mapped[float | None] = mapped_column(Float, nullable=True)

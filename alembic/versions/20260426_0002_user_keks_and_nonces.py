@@ -14,6 +14,8 @@ from __future__ import annotations
 import sqlalchemy as sa
 from alembic import op
 
+from app.alembic_idem import add_column, create_index, create_table
+
 revision: str = "0002_user_keks_and_nonces"
 down_revision: str | None = "0001_initial"
 branch_labels = None
@@ -21,7 +23,7 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.create_table(
+    create_table(
         "user_keks",
         sa.Column("user_id", sa.String(64), primary_key=True),
         sa.Column("wrapped_kek", sa.LargeBinary, nullable=False),
@@ -35,7 +37,7 @@ def upgrade() -> None:
         sa.Column("revoked_at", sa.DateTime(timezone=True), nullable=True),
     )
 
-    op.create_table(
+    create_table(
         "issued_nonces",
         sa.Column("nonce", sa.String(64), primary_key=True),
         sa.Column("user_id", sa.String(64), nullable=False, index=True),
@@ -49,7 +51,7 @@ def upgrade() -> None:
             nullable=False,
         ),
     )
-    op.create_index(
+    create_index(
         "ix_issued_nonces_expires_at", "issued_nonces", ["expires_at"]
     )
 
