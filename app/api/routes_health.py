@@ -128,13 +128,26 @@ async def readyz(response: Response) -> dict:
         overall_ok = False
         checks["object_store"] = {"ok": False, "error": str(e)[:120]}
 
-    # Anti-spoof model — in production its absence falls back to a sharpness
-    # heuristic that approves printed photos. Treat as fatal there.
+    # Anti-spoof model file — INFORMATIONAL, and deliberately not fatal.
+    #
+    # Nothing in the pipeline loads this file: the liveness path is the
+    # proprietary multi-signal engine in services/biometrical_liveness_engine.py
+    # (OpenCV + NumPy, no pre-trained weights), and grepping the runtime for
+    # onnxruntime finds exactly one hit - this probe. Treating it as fatal in
+    # production readied-out a service whose liveness never needed it, which
+    # is how the KYC box spent weeks reporting ok:false for a file no code
+    # path opens.
+    #
+    # It stays reported so a future engine that DOES load a model cannot lose
+    # the check silently: a note distinguishes "absent and unused" from
+    # "absent while something depends on it".
     model_path = s.anti_spoof_model_path
     model_present = await asyncio.to_thread(_probe_model_present, model_path)
-    checks["anti_spoof_model"] = {"ok": model_present, "path": model_path}
-    if s.is_prod and not model_present:
-        overall_ok = False
+    checks["anti_spoof_model"] = {
+        "ok": model_present,
+        "path": model_path,
+        "note": "loaded_by_pipeline=false; liveness runs the multi-signal engine",
+    }
 
     if not overall_ok:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE

@@ -131,11 +131,10 @@ class Settings(BaseSettings):
                 "RECEIPT_SIGNING_KEY must be set in production — autogeneration would invalidate "
                 "every previously-issued receipt across restarts"
             )
-        if not self.anti_spoof_model_sha256:
-            problems.append(
-                "ANTI_SPOOF_MODEL_SHA256 must be set in production "
-                "so the loaded model is verifiable"
-            )
+        # No requirement: the pipeline loads no such model (see the note on
+        # the anti_spoof_model check in routes_health), so demanding a hash
+        # for it blocked a production boot over a file nothing reads. If a
+        # future engine loads it again, this comes back with the loader.
         if "*" in self.cors_origin_list:
             problems.append("CORS_ORIGINS=* is incompatible with allow_credentials=True")
         if problems:
