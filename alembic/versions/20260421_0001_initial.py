@@ -9,7 +9,7 @@ from __future__ import annotations
 import sqlalchemy as sa
 from alembic import op
 
-from idem_guards import add_column, create_index, create_table
+from app.alembic_idem import add_column, create_index, create_table
 from sqlalchemy.dialects import postgresql
 
 revision: str = "0001_initial"

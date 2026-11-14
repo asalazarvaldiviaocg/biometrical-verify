@@ -16,7 +16,7 @@ from __future__ import annotations
 import sqlalchemy as sa
 from alembic import op
 
-from idem_guards import add_column, create_index, create_table
+from app.alembic_idem import add_column, create_index, create_table
 
 revision: str = "0004_id_phash"
 down_revision: str | None = "0003_admin_audit_status_index"

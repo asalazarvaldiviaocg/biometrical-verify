@@ -244,7 +244,21 @@ async def id_quality(
     id_bytes = await _read_capped(id_image, _settings.max_id_bytes)
     _check_mime(id_bytes, id_image.content_type, ALLOWED_IMG, "id_image")
     from app.services import id_parser
-    q = id_parser.assess(id_bytes)
+    try:
+        q = id_parser.assess(id_bytes)
+    except ValueError as _e:
+        # Unreadable bytes are a fact about the upload, not an outage: answer the
+        # quality contract (422 + reason) so the caller can tell the applicant
+        # their photograph is unreadable instead of reporting a server error.
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            {
+                "code": "unreadable",
+                "reasons": ["unreadable"],
+                "message": _id_quality_message("unreadable"),
+                "notes": str(_e)[:200],
+            },
+        )
     if not q.acceptable:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -356,7 +370,18 @@ async def guarantor_card(
     back_bytes = await _read_capped(card_back_image, _settings.max_id_bytes)
     _check_mime(back_bytes, card_back_image.content_type, ALLOWED_IMG, "card_back_image")
 
-    q = id_parser.assess(front_bytes)
+    try:
+        q = id_parser.assess(front_bytes)
+    except ValueError as _e:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            {
+                "code": "unreadable",
+                "reasons": ["unreadable"],
+                "message": _id_quality_message("unreadable"),
+                "notes": str(_e)[:200],
+            },
+        )
     if not q.acceptable:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY,
