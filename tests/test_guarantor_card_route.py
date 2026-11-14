@@ -271,3 +271,32 @@ def test_a_matching_name_is_graded_verified(
     body = r.json()
     assert body["name_status"] == "verified", body
     assert body["name"] == "verified", body
+
+
+def test_bytes_the_parser_cannot_read_answer_the_quality_contract_not_a_500(
+    client, auth_headers, ocr_says, monkeypatch
+):
+    """Unreadable bytes are the applicant's photograph, not our outage.
+
+    `assess` raising on bytes it cannot decode used to escape the route as a 500.
+    The caller maps a 500 to "the verification service is unavailable", so an
+    applicant who uploaded a truncated photograph was told the same thing as one
+    who uploaded it during an outage - with no way to tell which, and nothing to
+    fix. A 422 carrying the reason is the same contract the quality gate already
+    speaks when it can read the image and dislikes it.
+    """
+    from app.services import id_parser
+
+    def _boom(_bytes):
+        raise ValueError("Invalid ID image bytes")
+
+    monkeypatch.setattr(id_parser, "assess", _boom)
+
+    r = post_card(client, auth_headers, "Cedric Odonkor")
+
+    assert r.status_code == 422, r.text
+    body = r.json()
+    detail = body["detail"]
+    assert detail["code"] == "unreadable", body
+    assert detail["reasons"] == ["unreadable"], body
+    assert detail["message"], body

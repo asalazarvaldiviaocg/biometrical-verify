@@ -10,6 +10,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Known-bad placeholder values that ship in the example file. Boot must reject
 # these in production rather than silently accept them.
+# The phrase an operator types to accept production on a co-located key. A
+# constant so a typo in the env is a refusal, not a silent acceptance.
+KMS_LOCAL_ACK_VALUE = "i-accept-local-key-custody"
+
 _BAD_DEFAULTS_JWT = {"", "dev-jwt-secret-change-me", "change-me", "secret"}
 _BAD_DEFAULTS_MASTER_KEY_DECODED = b"dev-only-master-key-change-me-32-bytes"
 
@@ -46,6 +50,17 @@ class Settings(BaseSettings):
     kms_backend: Literal["local", "aws"] = "local"
     master_key: str = ""
     aws_kms_key_id: str = ""
+    # Production on a co-located master key is a deliberate, typed decision.
+    # The engine's envelope encryption treats KMS_BACKEND=local as dev-only
+    # because the master key then shares a box with the ciphertext it unwraps;
+    # that protects a stolen disk but not a compromised one. An operator who
+    # accepts that trade-off - and can record WHY - types the phrase below.
+    # Without it production still refuses, exactly as before.
+    kms_local_ack: str = ""
+    # Filled by the validator: non-fatal cautions the boot logs once, so the
+    # accepted trade-off is visible in every start instead of only in git.
+    cautions: list[str] = []
+
     receipt_signing_key: str = ""
 
     # Auth
@@ -121,9 +136,20 @@ class Settings(BaseSettings):
         if not self.master_key and self.kms_backend == "local":
             problems.append("MASTER_KEY must be set when KMS_BACKEND=local")
         if self.kms_backend == "local":
-            problems.append(
-                "KMS_BACKEND=local is dev-only; switch to KMS_BACKEND=aws + AWS_KMS_KEY_ID for prod"
-            )
+            if self.kms_local_ack != KMS_LOCAL_ACK_VALUE:
+                problems.append(
+                    "KMS_BACKEND=local is dev-only: the master key shares this box with the "
+                    "ciphertext, so a box compromise reads both. Set KMS_BACKEND=aws + "
+                    "AWS_KMS_KEY_ID, or accept the trade-off with "
+                    f"KMS_LOCAL_ACK={KMS_LOCAL_ACK_VALUE}"
+                )
+            else:
+                self.cautions.append(
+                    "KMS_BACKEND=local in production: the master key is co-located with the "
+                    "ciphertext it unwraps. Stolen-disk protection only; a box compromise "
+                    "reads both. Rotate to KMS_BACKEND=aws when affordable, and keep ~/.env "
+                    "and database backups out of the same place as each other."
+                )
         if self.kms_backend == "aws" and not self.aws_kms_key_id:
             problems.append("AWS_KMS_KEY_ID must be set when KMS_BACKEND=aws")
         if not self.receipt_signing_key:
