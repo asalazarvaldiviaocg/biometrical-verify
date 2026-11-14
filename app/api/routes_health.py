@@ -5,12 +5,13 @@ import os
 from pathlib import Path
 
 from fastapi import APIRouter, Response, status
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 
 from app import __version__
+from app.models.base import Base
 from app.core.config import get_settings
 from app.core.logging import get_logger
 from app.db.session import engine
@@ -48,9 +49,23 @@ def _probe_schema() -> str:
     """
     with engine.connect() as conn:
         row = conn.execute(text("SELECT version_num FROM alembic_version LIMIT 1")).first()
+        present = set(inspect(conn).get_table_names())
     current = row[0] if row else None
     if not current:
         raise RuntimeError("no migrations applied: alembic_version is empty")
+    # The version row is not the schema. On the KYC box the row read at head
+    # while the tables were gone - every probe, including this one, said
+    # healthy, and the first challenge insert would have 500'd. The models
+    # are the expected schema, so compare against them: self-maintaining, and
+    # it catches exactly the state that just happened (tables dropped
+    # underneath a current version row, where the idempotency guards never
+    # run because alembic has nothing left to apply).
+    missing = sorted(set(Base.metadata.tables) - present)
+    if missing:
+        raise RuntimeError(
+            f"alembic_version says {current} but these tables are missing: {missing} "
+            "- re-stamp the version row and re-run upgrade head"
+        )
     return current
 
 
