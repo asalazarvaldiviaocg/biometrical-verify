@@ -16,6 +16,8 @@ from __future__ import annotations
 import sqlalchemy as sa
 from alembic import op
 
+from idem_guards import add_column, create_index, create_table
+
 revision: str = "0004_id_phash"
 down_revision: str | None = "0003_admin_audit_status_index"
 branch_labels = None
@@ -23,10 +25,10 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column(
+    add_column(
         "verifications", sa.Column("id_phash", sa.String(16), nullable=True)
     )
-    op.create_index("ix_verifications_id_phash", "verifications", ["id_phash"])
+    create_index("ix_verifications_id_phash", "verifications", ["id_phash"])
 
 
 def downgrade() -> None:

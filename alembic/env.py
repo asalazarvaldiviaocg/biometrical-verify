@@ -1,6 +1,14 @@
 from __future__ import annotations
 
+import os
+import sys
 from logging.config import fileConfig
+
+# The idempotent-DDL helpers live beside this file, and the version scripts
+# import them by module name. Alembic imports version scripts itself, with
+# no package context, so their directory has to be importable for the
+# duration of a migration run - which is exactly the only place they run.
+sys.path.insert(0, os.path.dirname(__file__))
 
 from alembic import context
 from sqlalchemy import engine_from_config, pool
